@@ -14,7 +14,7 @@ REM Exit codes:
 REM   0 = Success
 REM   1 = Input .pt file not found / invalid
 REM   2 = Ultralytics YOLO (yolo) not installed or not on PATH
-REM   3 = Export failed or .onnx not created
+REM   3 = Export failed or .onnx not created / not moveable
 REM   4 = Python not installed or not on PATH
 REM   5 = User canceled or other unrecoverable error
 REM ================================================================
@@ -33,6 +33,7 @@ set "OUTPUT_DIR="
 set "OUTPUT_NAME="
 set "OUTPUT_EXT="
 set "GENERATED_ONNX="
+set "OUTPUT_ARG="
 set "PRESET="
 set "IMGSZ=960"
 set "PRESET_NAME=3 - Balanced (recommended)"
@@ -43,6 +44,7 @@ set "RAM_GB="
 set "HARDWARE_DETECTED=0"
 set "SUGGESTED_PRESET=3"
 set "SUGGESTED_PRESET_NAME=3 - Balanced (recommended)"
+set "LAST_ERRORLEVEL=0"
 
 call :line
 call :title "YOLO .PT TO ONNX CONVERTER"
@@ -140,10 +142,17 @@ if "%PRESET%"=="" (
 REM -------------------- Dependency checks --------------------
 call :line
 echo [STEP] Checking Python...
-python --version >nul 2>&1
+where python >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Python is required for Ultralytics YOLO.
     echo         Download Python and enable "Add python.exe to PATH" during install.
+    call :fail 4 "Python not installed or not on PATH"
+    goto :final
+)
+
+python --version >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Python command exists but is not working correctly.
     call :fail 4 "Python not installed or not on PATH"
     goto :final
 )
@@ -209,112 +218,107 @@ set "GENERATED_ONNX=%INPUT_DIR%%INPUT_BASE%.onnx"
 if not exist "%GENERATED_ONNX%" (
     echo [ERROR] Export command completed, but expected ONNX file was not created:
     echo         "%GENERATED_ONNX%"
-    call :fail 3 "Export finished but .onnx not created"
+    call :fail 3 "Export completed but ONNX file missing"
     goto :final
 )
 
-if /I not "%GENERATED_ONNX%"=="%OUTPUT_ONNX%" (
-    move /Y "%GENERATED_ONNX%" "%OUTPUT_ONNX%" >nul 2>&1
-    if errorlevel 1 (
-        echo [ERROR] Export succeeded, but failed to move output file to:
-        echo         "%OUTPUT_ONNX%"
-        echo         Generated file remains at: "%GENERATED_ONNX%"
-        call :fail 3 "Failed to move exported .onnx"
+if /I "%GENERATED_ONNX%"=="%OUTPUT_ONNX%" (
+    if exist "%OUTPUT_ONNX%" (
+        echo [OK] Conversion complete.
+        call :fail 0 "Success"
+        goto :final
+    ) else (
+        echo [ERROR] Export reported success, but output is not present at expected path.
+        call :fail 3 "ONNX output missing after export"
         goto :final
     )
 )
 
-if not exist "%OUTPUT_ONNX%" (
-    echo [ERROR] Output file not found after export:
-    echo         "%OUTPUT_ONNX%"
-    call :fail 3 "Output .onnx file not found"
+move /Y "%GENERATED_ONNX%" "%OUTPUT_ONNX%" >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Could not move generated ONNX file to requested output path.
+    echo         Source: "%GENERATED_ONNX%"
+    echo         Target: "%OUTPUT_ONNX%"
+    call :fail 3 "ONNX generated but could not be moved"
     goto :final
 )
 
-echo [OK] Export completed successfully.
-
-REM -------------------- Optional source deletion --------------------
-:delete_prompt
-call :line
-set "DELETE_CHOICE="
-set /p DELETE_CHOICE="[INPUT] Do you want to delete the original .pt file? [Y/n]: "
-if "%DELETE_CHOICE%"=="" set "DELETE_CHOICE=Y"
-if /I "%DELETE_CHOICE%"=="Y" (
-    del /F /Q "%INPUT_ABS%" >nul 2>&1
-    if errorlevel 1 (
-        echo [WARN] Could not delete "%INPUT_ABS%". File has been kept.
-    ) else (
-        echo [OK] Original .pt file deleted.
-    )
-) else if /I "%DELETE_CHOICE%"=="N" (
-    echo [OK] Original .pt file kept.
-) else (
-    echo [WARN] Invalid choice. Please enter Y or N.
-    goto :delete_prompt
+if not exist "%OUTPUT_ONNX%" (
+    echo [ERROR] Move command returned success, but output file is missing:
+    echo         "%OUTPUT_ONNX%"
+    call :fail 3 "Output ONNX missing after move"
+    goto :final
 )
 
-set "EXIT_CODE=0"
-set "EXIT_REASON=Success"
+echo [OK] Conversion complete.
+call :fail 0 "Success"
 goto :final
 
-REM -------------------- Helpers --------------------
 :select_input_model
 set "PT_COUNT=0"
-for /f "delims=" %%F in ('dir /b /a:-d "*.pt" 2^>nul') do (
+for /f "delims=" %%F in ('dir /b /a:-d "%~dp0*.pt" 2^>nul') do (
     set /a PT_COUNT+=1
     set "PT_FILE_!PT_COUNT!=%%F"
 )
 
 if "%PT_COUNT%"=="0" (
-    echo [ERROR] No .pt files were found in "%~dp0".
-    echo         Place a .pt file next to this script or pass a full path as arg1.
-    call :fail 1 "Input .pt file not found"
+    echo [ERROR] No .pt files were found next to this script:
+    echo         "%~dp0"
+    echo         Place a .pt model next to this script or pass a full path as arg1.
+    call :fail 1 "No input .pt found"
     exit /b 1
 )
 
 if "%PT_COUNT%"=="1" (
-    set "INPUT_PT=!PT_FILE_1!"
-    echo [INFO] Using detected model: !PT_FILE_1!
+    set "INPUT_PT=%~dp0!PT_FILE_1!"
+    echo [INFO] Using detected model: "!PT_FILE_1!"
     exit /b 0
 )
 
+:select_model_prompt
 call :line
-echo [INFO] Multiple .pt models detected in "%~dp0":
-for /l %%N in (1,1,%PT_COUNT%) do echo        [%%N] !PT_FILE_%%N!
-set "MODEL_INDEX="
-set /p MODEL_INDEX="[INPUT] Select the model to convert by number, or press Enter to cancel: "
-if "%MODEL_INDEX%"=="" (
+echo [INFO] Multiple .pt files found next to this script:
+for /L %%N in (1,1,%PT_COUNT%) do (
+    echo        [%%N] !PT_FILE_%%N!
+)
+set "MODEL_CHOICE="
+set /p MODEL_CHOICE="[INPUT] Select the model to convert by number, or press Enter to cancel: "
+
+if "%MODEL_CHOICE%"=="" (
     echo [INFO] Operation canceled by user.
     call :fail 5 "User canceled model selection"
     exit /b 1
 )
 
-set /a MODEL_INDEX_NUM=%MODEL_INDEX%+0 >nul 2>&1
+echo(%MODEL_CHOICE%| findstr /R "^[0-9][0-9]*$" >nul
 if errorlevel 1 (
-    echo [ERROR] Invalid selection: "%MODEL_INDEX%".
-    call :fail 5 "Invalid model selection"
-    exit /b 1
+    echo [WARN] Invalid selection. Please enter a number between 1 and %PT_COUNT%, or press Enter to cancel.
+    goto :select_model_prompt
 )
 
-if %MODEL_INDEX_NUM% LSS 1 (
-    echo [ERROR] Invalid selection: "%MODEL_INDEX%".
-    call :fail 5 "Invalid model selection"
-    exit /b 1
-)
-if %MODEL_INDEX_NUM% GTR %PT_COUNT% (
-    echo [ERROR] Invalid selection: "%MODEL_INDEX%".
-    call :fail 5 "Invalid model selection"
-    exit /b 1
+set /a MODEL_INDEX=%MODEL_CHOICE% >nul 2>&1
+if errorlevel 1 (
+    echo [WARN] Invalid selection. Please enter a valid number.
+    goto :select_model_prompt
 )
 
-call set "INPUT_PT=%%PT_FILE_%MODEL_INDEX_NUM%%%"
+if %MODEL_INDEX% LSS 1 (
+    echo [WARN] Invalid selection. Please enter a number between 1 and %PT_COUNT%.
+    goto :select_model_prompt
+)
+if %MODEL_INDEX% GTR %PT_COUNT% (
+    echo [WARN] Invalid selection. Please enter a number between 1 and %PT_COUNT%.
+    goto :select_model_prompt
+)
+
+call set "INPUT_PT=%%~dp0%%PT_FILE_%MODEL_INDEX%%%"
 if "%INPUT_PT%"=="" (
-    echo [ERROR] Could not resolve selected model.
+    echo [ERROR] Failed to resolve selected model.
     call :fail 5 "Invalid model selection"
     exit /b 1
 )
 
-echo [INFO] Using selected model: %INPUT_PT%
+echo [INFO] Using selected model: "!PT_FILE_%MODEL_INDEX%!"
 exit /b 0
 
 :detect_hardware
@@ -323,14 +327,21 @@ set "CPU_NAME="
 set "RAM_GB="
 set "HARDWARE_DETECTED=0"
 set "SUGGESTED_PRESET=3"
+set "SUGGESTED_PRESET_NAME=3 - Balanced (recommended)"
 
 where powershell >nul 2>&1
 if errorlevel 1 exit /b 1
 
-for /f "usebackq tokens=1* delims==" %%A in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $gpu=(Get-CimInstance Win32_VideoController | Select-Object -First 1 -ExpandProperty Name); $cpu=(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name); $ram=([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)); if($gpu){Write-Output ('GPU=' + $gpu)}; if($cpu){Write-Output ('CPU=' + $cpu)}; if($ram){Write-Output ('RAM=' + $ram)}" 2^>nul`) do (
-    if /I "%%A"=="GPU" set "GPU_NAME=%%B"
-    if /I "%%A"=="CPU" set "CPU_NAME=%%B"
-    if /I "%%A"=="RAM" set "RAM_GB=%%B"
+for /f "usebackq delims=" %%G in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; (Get-CimInstance Win32_VideoController ^| Select-Object -First 1 -ExpandProperty Name)" 2^>nul`) do (
+    if not defined GPU_NAME set "GPU_NAME=%%G"
+)
+
+for /f "usebackq delims=" %%C in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; (Get-CimInstance Win32_Processor ^| Select-Object -First 1 -ExpandProperty Name)" 2^>nul`) do (
+    if not defined CPU_NAME set "CPU_NAME=%%C"
+)
+
+for /f "usebackq delims=" %%R in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; ([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB))" 2^>nul`) do (
+    if not defined RAM_GB set "RAM_GB=%%R"
 )
 
 if defined GPU_NAME set "HARDWARE_DETECTED=1"
@@ -340,6 +351,7 @@ if "%HARDWARE_DETECTED%"=="0" exit /b 1
 
 set "IS_HIGH_GPU=0"
 set "IS_LOW_GPU=0"
+set "RAM_NUM="
 
 if defined GPU_NAME (
     echo !GPU_NAME! | find /I "RTX" >nul && set "IS_HIGH_GPU=1"
@@ -360,17 +372,19 @@ if defined GPU_NAME (
 
 if defined RAM_GB (
     set /a RAM_NUM=RAM_GB+0 >nul 2>&1
-    if not errorlevel 1 (
-        if !RAM_NUM! LSS 8 set "SUGGESTED_PRESET=1"
-    )
+    if errorlevel 1 set "RAM_NUM="
+)
+
+if defined RAM_NUM (
+    if !RAM_NUM! LSS 8 set "SUGGESTED_PRESET=1"
 )
 
 if "%SUGGESTED_PRESET%"=="3" if "%IS_LOW_GPU%"=="1" set "SUGGESTED_PRESET=1"
 
 if "%SUGGESTED_PRESET%"=="3" (
     if "%IS_HIGH_GPU%"=="1" (
-        if defined RAM_GB (
-            if !RAM_GB! GEQ 16 set "SUGGESTED_PRESET=2"
+        if defined RAM_NUM (
+            if !RAM_NUM! GEQ 16 set "SUGGESTED_PRESET=2"
         )
     )
 )
@@ -408,13 +422,16 @@ echo        [C] Cancel
 set "PRESET_INPUT="
 set /p PRESET_INPUT="[INPUT] Enter 1, 2, or 3 [default !SUGGESTED_PRESET!]: "
 
-if "%PRESET_INPUT%"=="" set "PRESET=!SUGGESTED_PRESET!"
-if /I "%PRESET_INPUT%"=="C" (
-    echo [INFO] Operation canceled by user.
-    call :fail 5 "User canceled preset selection"
-    exit /b 1
+if "%PRESET_INPUT%"=="" (
+    set "PRESET=!SUGGESTED_PRESET!"
+) else (
+    if /I "%PRESET_INPUT%"=="C" (
+        echo [INFO] Operation canceled by user.
+        call :fail 5 "User canceled preset selection"
+        exit /b 1
+    )
+    set "PRESET=%PRESET_INPUT%"
 )
-if not "%PRESET_INPUT%"=="" set "PRESET=%PRESET_INPUT%"
 
 call :apply_preset "%PRESET%"
 if errorlevel 1 (
@@ -450,6 +467,7 @@ exit /b 1
 set "OVERWRITE_CHOICE="
 set /p OVERWRITE_CHOICE="[INPUT] Overwrite existing output file? [y/N]: "
 if "%OVERWRITE_CHOICE%"=="" set "OVERWRITE_CHOICE=N"
+
 if /I "%OVERWRITE_CHOICE%"=="Y" (
     del /F /Q "%OUTPUT_ONNX%" >nul 2>&1
     if errorlevel 1 (
@@ -457,13 +475,20 @@ if /I "%OVERWRITE_CHOICE%"=="Y" (
         call :fail 5 "Cannot overwrite existing output file"
         exit /b 1
     )
+    if exist "%OUTPUT_ONNX%" (
+        echo [ERROR] Existing output file still present after delete attempt.
+        call :fail 5 "Cannot overwrite existing output file"
+        exit /b 1
+    )
     exit /b 0
 )
+
 if /I "%OVERWRITE_CHOICE%"=="N" (
     echo [INFO] Operation canceled by user.
     call :fail 5 "User canceled because output already exists"
     exit /b 1
 )
+
 echo [WARN] Invalid choice. Enter Y or N.
 goto :overwrite_prompt
 
@@ -482,6 +507,7 @@ exit /b 0
 
 REM -------------------- Final summary and exit --------------------
 :final
+set "LAST_ERRORLEVEL=%ERRORLEVEL%"
 call :line
 echo SUMMARY
 echo   Input file          : "%INPUT_ABS%"
@@ -489,13 +515,8 @@ echo   Output file         : "%OUTPUT_ONNX%"
 echo   Optimization preset : %PRESET_NAME% ^(imgsz=%IMGSZ%^)
 echo   Exit status         : %EXIT_REASON%
 echo   Exit code           : %EXIT_CODE%
+echo   Final ERRORLEVEL    : %LAST_ERRORLEVEL%
 call :line
-
-if not "%EXIT_CODE%"=="0" (
-    echo.
-    echo [INFO] The converter encountered an error. Press any key to close this window.
-    pause >nul
-)
 
 if "%DID_PUSHD%"=="1" popd >nul 2>&1
 endlocal & exit /b %EXIT_CODE%
