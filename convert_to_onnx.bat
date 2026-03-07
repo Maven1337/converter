@@ -1,4 +1,16 @@
 @echo off
+REM === SELF-LAUNCH: Opens CMD window + runs interactive ===
+if defined AUTOMATED_MODE goto :main
+if /I "%~1"=="--interactive" (
+    set "AUTOMATED_MODE=1"
+    shift
+    goto :main
+)
+if "%~1"=="" (
+    start cmd /k "cd /d ""%~dp0"" && set AUTOMATED_MODE=1 && ""%~f0"" --interactive"
+    exit /b
+)
+:main
 setlocal EnableExtensions DisableDelayedExpansion
 
 REM ================================================================
@@ -47,6 +59,7 @@ set "STATE_HW_RAM_GB="
 set "STATE_SUGGESTED_PRESET=3"
 set "STATE_UNC_WARNING=0"
 set "STATE_READONLY_WARNING=0"
+set "STATE_INTERACTIVE=0"
 
 set "ARG_INPUT="
 set "ARG_OUTPUT="
@@ -99,6 +112,11 @@ if /I "%STATE_TOKEN%"=="--debug" (
     shift
     goto :parse_args
 )
+if /I "%STATE_TOKEN%"=="--interactive" (
+    set "STATE_INTERACTIVE=1"
+    shift
+    goto :parse_args
+)
 if "%STATE_TOKEN:~0,2%"=="--" (
     echo [ERROR] Unknown flag: "%STATE_TOKEN%"
     call :fail 5 "Unknown flag provided" 2
@@ -128,9 +146,16 @@ call :debug "ARG_INPUT=%ARG_INPUT%"
 call :debug "ARG_OUTPUT=%ARG_OUTPUT%"
 call :debug "ARG_PRESET=%ARG_PRESET%"
 
+if "%STATE_INTERACTIVE%"=="1" (
+    call :line
+    echo        YOLO PT^>ONNX CONVERTER v2.0 - INTERACTIVE
+    call :line
+)
+
 if not "%ARG_INPUT%"=="" (
     set "RESOLVED_INPUT=%ARG_INPUT%"
 ) else (
+    if "%STATE_INTERACTIVE%"=="1" echo 1. Scanning .pt files...
     call :select_input_model
     if errorlevel 1 goto :final
 )
@@ -163,7 +188,12 @@ if not exist "%RESOLVED_INPUT%" (
 echo [OK] Input model found: "%RESOLVED_INPUT%"
 
 if "%ARG_OUTPUT%"=="" (
-    set "RESOLVED_OUTPUT=%RESOLVED_INPUT_DIR%%RESOLVED_INPUT_BASE%.onnx"
+    if "%STATE_INTERACTIVE%"=="1" (
+        call :prompt_output_name
+        if errorlevel 1 goto :final
+    ) else (
+        set "RESOLVED_OUTPUT=%RESOLVED_INPUT_DIR%%RESOLVED_INPUT_BASE%.onnx"
+    )
 ) else (
     for %%O in ("%ARG_OUTPUT%") do set "RESOLVED_OUTPUT=%%~fO"
     if /I not "%RESOLVED_OUTPUT:~-5%"==".onnx" set "RESOLVED_OUTPUT=%RESOLVED_OUTPUT%.onnx"
@@ -243,6 +273,7 @@ if errorlevel 1 (
 )
 
 if "%ARG_PRESET%"=="" (
+    if "%STATE_INTERACTIVE%"=="1" echo 3. Preset: [Enter=Auto hardware detect]
     call :prompt_preset
     if errorlevel 1 goto :final
 ) else (
@@ -256,13 +287,15 @@ if "%ARG_PRESET%"=="" (
 )
 
 if "%ARG_OUTPUT%"=="" (
-    if "%CURRENT_PRESET%"=="1" set "RESOLVED_OUTPUT=%RESOLVED_INPUT_DIR%%RESOLVED_INPUT_BASE%_best_performance.onnx"
-    if "%CURRENT_PRESET%"=="2" set "RESOLVED_OUTPUT=%RESOLVED_INPUT_DIR%%RESOLVED_INPUT_BASE%_best_detection.onnx"
-    if "%CURRENT_PRESET%"=="3" set "RESOLVED_OUTPUT=%RESOLVED_INPUT_DIR%%RESOLVED_INPUT_BASE%_best_balanced.onnx"
-    for %%O in ("%RESOLVED_OUTPUT%") do (
-        set "RESOLVED_OUTPUT=%%~fO"
-        set "RESOLVED_OUTPUT_DIR=%%~dpO"
-        set "RESOLVED_OUTPUT_NAME=%%~nxO"
+    if "%STATE_INTERACTIVE%"=="0" (
+        if "%CURRENT_PRESET%"=="1" set "RESOLVED_OUTPUT=%RESOLVED_INPUT_DIR%%RESOLVED_INPUT_BASE%_best_performance.onnx"
+        if "%CURRENT_PRESET%"=="2" set "RESOLVED_OUTPUT=%RESOLVED_INPUT_DIR%%RESOLVED_INPUT_BASE%_best_detection.onnx"
+        if "%CURRENT_PRESET%"=="3" set "RESOLVED_OUTPUT=%RESOLVED_INPUT_DIR%%RESOLVED_INPUT_BASE%_best_balanced.onnx"
+        for %%O in ("%RESOLVED_OUTPUT%") do (
+            set "RESOLVED_OUTPUT=%%~fO"
+            set "RESOLVED_OUTPUT_DIR=%%~dpO"
+            set "RESOLVED_OUTPUT_NAME=%%~nxO"
+        )
     )
 )
 
@@ -281,7 +314,7 @@ if exist "%RESOLVED_OUTPUT%" (
             )
         )
     ) else (
-        call :validate_input "Overwrite existing output file? [y/N/C]: " "N" "Y N C" "3" "OVERWRITE_CHOICE"
+        call :prompt_yes_no_cancel "Overwrite existing output file?" "N" "OVERWRITE_CHOICE"
         if errorlevel 1 goto :final
         if /I "%OVERWRITE_CHOICE%"=="C" (
             call :fail 5 "User canceled because output already exists" 1
@@ -309,6 +342,7 @@ if exist "%RESOLVED_OUTPUT%" (
 goto :export
 
 :export
+if "%STATE_INTERACTIVE%"=="1" echo [STEP] Starting conversion...
 call :line
 echo [PLAN] Input file : "%RESOLVED_INPUT%"
 echo [PLAN] Output file: "%RESOLVED_OUTPUT%"
@@ -376,7 +410,7 @@ echo [OK] Conversion complete.
 if "%STATE_ASSUME_YES%"=="1" (
     set "DELETE_CHOICE=Y"
 ) else (
-    call :validate_input "Delete source .pt model after successful conversion? [y/N/C]: " "N" "Y N C" "3" "DELETE_CHOICE"
+    call :prompt_yes_no_cancel "Delete source .pt model after successful conversion?" "N" "DELETE_CHOICE"
     if errorlevel 1 goto :cleanup
 )
 
@@ -574,8 +608,13 @@ set "STATE_SELECT_TRY=0"
 :select_loop
 set /a STATE_SELECT_TRY+=1
 set "STATE_CHOICE="
-set /p STATE_CHOICE=[INPUT] Select model number [1-!STATE_PT_COUNT!] or C: 
-if "!STATE_CHOICE!"=="" set "STATE_CHOICE=C"
+if "%STATE_INTERACTIVE%"=="1" (
+    set /p STATE_CHOICE=[INPUT] Select model ^(1-!STATE_PT_COUNT!^) [Enter=1, C=Cancel]: 
+    if "!STATE_CHOICE!"=="" set "STATE_CHOICE=1"
+) else (
+    set /p STATE_CHOICE=[INPUT] Select model number [1-!STATE_PT_COUNT!] or C: 
+    if "!STATE_CHOICE!"=="" set "STATE_CHOICE=C"
+)
 if /I "!STATE_CHOICE!"=="C" (
     endlocal
     call :fail 5 "User canceled model selection" 1
@@ -605,6 +644,39 @@ if !STATE_SELECT_TRY! GEQ 3 (
     exit /b 1
 )
 goto :select_loop
+
+:prompt_output_name
+if not "%STATE_INTERACTIVE%"=="1" exit /b 0
+echo 2. Output filename: [Enter=%RESOLVED_INPUT_BASE%.onnx]
+set "STATE_OUTPUT_NAME="
+set /p STATE_OUTPUT_NAME=[INPUT] Output filename: 
+if "%STATE_OUTPUT_NAME%"=="" set "STATE_OUTPUT_NAME=%RESOLVED_INPUT_BASE%.onnx"
+for %%O in ("%STATE_OUTPUT_NAME%") do set "STATE_OUTPUT_CLEAN=%%~nxO"
+if "%STATE_OUTPUT_CLEAN%"=="" set "STATE_OUTPUT_CLEAN=%RESOLVED_INPUT_BASE%.onnx"
+if /I not "%STATE_OUTPUT_CLEAN:~-5%"==".onnx" set "STATE_OUTPUT_CLEAN=%STATE_OUTPUT_CLEAN%.onnx"
+set "RESOLVED_OUTPUT=%RESOLVED_INPUT_DIR%%STATE_OUTPUT_CLEAN%"
+exit /b 0
+
+:prompt_yes_no_cancel
+setlocal
+set "STATE_PROMPT_TEXT=%~1"
+set "STATE_PROMPT_DEFAULT=%~2"
+set "STATE_PROMPT_OUTVAR=%~3"
+set "STATE_DEFAULT_SWITCH=/D N"
+if /I "%STATE_PROMPT_DEFAULT%"=="Y" set "STATE_DEFAULT_SWITCH=/D Y"
+if /I "%STATE_PROMPT_DEFAULT%"=="C" set "STATE_DEFAULT_SWITCH=/D C"
+choice /C YNC /N /M "%STATE_PROMPT_TEXT% [Y/N/C]: " %STATE_DEFAULT_SWITCH%
+set "STATE_CHOICE_RC=%ERRORLEVEL%"
+if "%STATE_CHOICE_RC%"=="1" (endlocal & set "%STATE_PROMPT_OUTVAR%=Y" & exit /b 0)
+if "%STATE_CHOICE_RC%"=="2" (endlocal & set "%STATE_PROMPT_OUTVAR%=N" & exit /b 0)
+if "%STATE_CHOICE_RC%"=="3" (
+    endlocal
+    call :fail 5 "User canceled" 1
+    exit /b 1
+)
+endlocal
+call :fail 5 "Prompt input failed" 2
+exit /b 1
 
 :preflight_writable
 set "STATE_TEMP_FILE=%~1convert_write_test_%RANDOM%_%RANDOM%.tmp"
