@@ -491,5 +491,11 @@ echo   Exit status         : %EXIT_REASON%
 echo   Exit code           : %EXIT_CODE%
 call :line
 
+if not "%EXIT_CODE%"=="0" (
+    echo.
+    echo [INFO] The converter encountered an error. Press any key to close this window.
+    pause >nul
+)
+
 if "%DID_PUSHD%"=="1" popd >nul 2>&1
 endlocal & exit /b %EXIT_CODE%
