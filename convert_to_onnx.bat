@@ -1,16 +1,19 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
+setlocal EnableExtensions DisableDelayedExpansion
 
 REM ================================================================
 REM convert_to_onnx.bat
 REM Converts a YOLO .pt model to ONNX using Ultralytics YOLO.
 REM
-REM Arguments (same interface):
+REM Arguments (unchanged interface):
 REM   arg1 = input .pt model path
 REM   arg2 = optional output .onnx path
 REM   arg3 = optional optimization preset (1, 2, or 3)
-REM Optional:
-REM   --debug enables verbose debug output (can be passed anywhere).
+REM Optional flags:
+REM   --dry-run  : validate and print planned actions, execute nothing mutating
+REM   --yes      : auto-accept overwrite/delete prompts
+REM   --verbose  : print extra diagnostics and write logs
+REM   --debug    : alias of --verbose
 REM
 REM Exit codes:
 REM   0 = Success
@@ -19,567 +22,701 @@ REM   2 = Ultralytics YOLO (yolo) not installed or not on PATH
 REM   3 = Export failed or .onnx not created / not moved
 REM   4 = Python not installed or not on PATH
 REM   5 = User canceled or other unrecoverable error
+REM      subtype 5.1 = user canceled
+REM      subtype 5.2 = internal/unrecoverable runtime error
 REM ================================================================
 
-set "EXIT_CODE=0"
-set "EXIT_REASON=Success"
-set "DID_PUSHD=0"
-set "INPUT_PT="
-set "INPUT_ABS="
-set "INPUT_NAME="
-set "INPUT_BASE="
-set "INPUT_EXT="
-set "INPUT_DIR="
-set "OUTPUT_ONNX="
-set "OUTPUT_DIR="
-set "OUTPUT_NAME="
-set "OUTPUT_EXT="
-set "GENERATED_ONNX="
-set "OUTPUT_ARG="
-set "PRESET="
-set "IMGSZ=960"
-set "PRESET_NAME=3 - Balanced (recommended)"
-set "PRESET_DESC=Balanced speed and detection quality for most users"
-set "GPU_NAME="
-set "CPU_NAME="
-set "RAM_GB="
-set "HARDWARE_DETECTED=0"
-set "SUGGESTED_PRESET=3"
-set "SUGGESTED_PRESET_NAME=3 - Balanced (recommended)"
-set "LAST_ERRORLEVEL=0"
-set "DEBUG_MODE=0"
-set "LOG_ENABLED=0"
-set "LOG_FILE="
+set "STATE_EXIT_CODE=0"
+set "STATE_EXIT_REASON=Success"
+set "STATE_EXIT_SUBCODE=0"
+set "STATE_DID_PUSHD=0"
+set "STATE_LAST_ERRORLEVEL=0"
+set "STATE_DRY_RUN=0"
+set "STATE_ASSUME_YES=0"
+set "STATE_VERBOSE=0"
+set "STATE_LOG_ENABLED=0"
+set "STATE_LOG_FILE="
+set "STATE_TEMP_FILE="
+set "STATE_PYTHON_CMD="
+set "STATE_PYTHON_WHERE="
+set "STATE_YOLO_WHERE="
+set "STATE_HW_DETECTED=0"
+set "STATE_HW_GPU="
+set "STATE_HW_CPU="
+set "STATE_HW_RAM_GB="
+set "STATE_SUGGESTED_PRESET=3"
+set "STATE_UNC_WARNING=0"
+set "STATE_READONLY_WARNING=0"
 
-set "RAW_ARG1="
-set "RAW_ARG2="
-set "RAW_ARG3="
-set "NONDEBUG_COUNT=0"
-for %%A in (%*) do (
-    if /I "%%~A"=="--debug" (
-        set "DEBUG_MODE=1"
-    ) else (
-        set /a NONDEBUG_COUNT+=1
-        if !NONDEBUG_COUNT! EQU 1 set "RAW_ARG1=%%~A"
-        if !NONDEBUG_COUNT! EQU 2 set "RAW_ARG2=%%~A"
-        if !NONDEBUG_COUNT! EQU 3 set "RAW_ARG3=%%~A"
-    )
-)
-if /I "%CONVERT_ONNX_DEBUG%"=="1" set "DEBUG_MODE=1"
+set "ARG_INPUT="
+set "ARG_OUTPUT="
+set "ARG_PRESET="
+set "RESOLVED_INPUT="
+set "RESOLVED_INPUT_DIR="
+set "RESOLVED_INPUT_BASE="
+set "RESOLVED_INPUT_NAME="
+set "RESOLVED_OUTPUT="
+set "RESOLVED_OUTPUT_DIR="
+set "RESOLVED_OUTPUT_NAME="
+set "RESOLVED_GENERATED_ONNX="
+set "CURRENT_PRESET=3"
+set "CURRENT_PRESET_NAME=3 - Balanced (recommended)"
+set "CURRENT_PRESET_DESC=Balanced speed and detection quality for most users"
+set "CURRENT_IMGSZ=960"
+set "STATE_EXPORT_RC=0"
+set "STATE_MOVE_RC=0"
+set "STATE_DELETE_RC=0"
+set "STATE_FAILING_COMMAND="
+
+set "STATE_POSITIONAL_COUNT=0"
 
 call :line
 call :title "YOLO .PT TO ONNX CONVERTER"
 call :line
 
-REM -------------------- Switch to script directory --------------------
+goto :parse_args
+
+:parse_args
+if "%~1"=="" goto :validate
+set "STATE_TOKEN=%~1"
+if /I "%STATE_TOKEN%"=="--dry-run" (
+    set "STATE_DRY_RUN=1"
+    shift
+    goto :parse_args
+)
+if /I "%STATE_TOKEN%"=="--yes" (
+    set "STATE_ASSUME_YES=1"
+    shift
+    goto :parse_args
+)
+if /I "%STATE_TOKEN%"=="--verbose" (
+    set "STATE_VERBOSE=1"
+    shift
+    goto :parse_args
+)
+if /I "%STATE_TOKEN%"=="--debug" (
+    set "STATE_VERBOSE=1"
+    shift
+    goto :parse_args
+)
+if "%STATE_TOKEN:~0,2%"=="--" (
+    echo [ERROR] Unknown flag: "%STATE_TOKEN%"
+    call :fail 5 "Unknown flag provided" 2
+    goto :final
+)
+set /a STATE_POSITIONAL_COUNT+=1
+if "%STATE_POSITIONAL_COUNT%"=="1" set "ARG_INPUT=%~1"
+if "%STATE_POSITIONAL_COUNT%"=="2" set "ARG_OUTPUT=%~1"
+if "%STATE_POSITIONAL_COUNT%"=="3" set "ARG_PRESET=%~1"
+shift
+goto :parse_args
+
+:validate
+if /I "%DEBUG%"=="1" set "STATE_VERBOSE=1"
+
 pushd "%~dp0" >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Could not switch to script directory: "%~dp0"
-    call :fail 5 "Could not switch to script directory"
+    call :fail 5 "Could not switch to script directory" 2
     goto :final
 )
-set "DID_PUSHD=1"
+set "STATE_DID_PUSHD=1"
 
 call :init_logging
-call :debug "Debug mode enabled."
-call :debug "RAW_ARG1=%RAW_ARG1%"
-call :debug "RAW_ARG2=%RAW_ARG2%"
-call :debug "RAW_ARG3=%RAW_ARG3%"
+call :log "args=%*"
+call :debug "ARG_INPUT=%ARG_INPUT%"
+call :debug "ARG_OUTPUT=%ARG_OUTPUT%"
+call :debug "ARG_PRESET=%ARG_PRESET%"
 
-REM -------------------- Argument handling and file selection --------------------
-if not "%RAW_ARG1%"=="" (
-    set "INPUT_PT=%RAW_ARG1%"
+if not "%ARG_INPUT%"=="" (
+    set "RESOLVED_INPUT=%ARG_INPUT%"
 ) else (
     call :select_input_model
     if errorlevel 1 goto :final
 )
 
-for %%I in ("%INPUT_PT%") do (
-    set "INPUT_ABS=%%~fI"
-    set "INPUT_NAME=%%~nxI"
-    set "INPUT_BASE=%%~nI"
-    set "INPUT_EXT=%%~xI"
-    set "INPUT_DIR=%%~dpI"
+for %%I in ("%RESOLVED_INPUT%") do (
+    set "RESOLVED_INPUT=%%~fI"
+    set "RESOLVED_INPUT_DIR=%%~dpI"
+    set "RESOLVED_INPUT_BASE=%%~nI"
+    set "RESOLVED_INPUT_NAME=%%~nxI"
 )
 
-if "%INPUT_ABS%"=="" (
+if "%RESOLVED_INPUT%"=="" (
     echo [ERROR] No input model path could be resolved.
-    call :fail 1 "Input .pt file not found / invalid"
+    call :missing_pt_help
+    call :fail 1 "Input .pt file not found / invalid" 0
     goto :final
 )
-if /I not "%INPUT_EXT%"==".pt" (
-    echo [ERROR] Input file must be a .pt model: "%INPUT_ABS%"
-    call :fail 1 "Input file extension is not .pt"
+if /I not "%RESOLVED_INPUT:~-3%"==".pt" (
+    echo [ERROR] Input file must be a .pt model: "%RESOLVED_INPUT%"
+    call :missing_pt_help
+    call :fail 1 "Input file extension is not .pt" 0
     goto :final
 )
-if not exist "%INPUT_ABS%" (
-    echo [ERROR] Input file not found: "%INPUT_ABS%"
-    echo         Place a .pt file next to this script or pass a full path as arg1.
-    call :fail 1 "Input .pt file not found"
+if not exist "%RESOLVED_INPUT%" (
+    echo [ERROR] Input file not found: "%RESOLVED_INPUT%"
+    call :missing_pt_help
+    call :fail 1 "Input .pt file not found" 0
     goto :final
 )
-echo [OK] Input model found: "%INPUT_ABS%"
+echo [OK] Input model found: "%RESOLVED_INPUT%"
 
-set "OUTPUT_ARG=%RAW_ARG2%"
-if "%OUTPUT_ARG%"=="" (
-    set "OUTPUT_ONNX=%INPUT_DIR%%INPUT_BASE%.onnx"
+if "%ARG_OUTPUT%"=="" (
+    set "RESOLVED_OUTPUT=%RESOLVED_INPUT_DIR%%RESOLVED_INPUT_BASE%.onnx"
 ) else (
-    for %%O in ("%OUTPUT_ARG%") do (
-        set "OUTPUT_ONNX=%%~fO"
-        set "OUTPUT_EXT=%%~xO"
-    )
-    if /I not "%OUTPUT_EXT%"==".onnx" set "OUTPUT_ONNX=%OUTPUT_ONNX%.onnx"
+    for %%O in ("%ARG_OUTPUT%") do set "RESOLVED_OUTPUT=%%~fO"
+    if /I not "%RESOLVED_OUTPUT:~-5%"==".onnx" set "RESOLVED_OUTPUT=%RESOLVED_OUTPUT%.onnx"
 )
-for %%P in ("%OUTPUT_ONNX%") do (
-    set "OUTPUT_DIR=%%~dpP"
-    set "OUTPUT_NAME=%%~nxP"
+for %%O in ("%RESOLVED_OUTPUT%") do (
+    set "RESOLVED_OUTPUT=%%~fO"
+    set "RESOLVED_OUTPUT_DIR=%%~dpO"
+    set "RESOLVED_OUTPUT_NAME=%%~nxO"
 )
-if "%OUTPUT_DIR%"=="" (
-    echo [ERROR] Could not resolve output directory from: "%OUTPUT_ONNX%"
-    call :fail 5 "Invalid output path"
+
+if "%RESOLVED_OUTPUT_DIR%"=="" (
+    echo [ERROR] Could not resolve output directory from "%RESOLVED_OUTPUT%".
+    call :fail 5 "Invalid output path" 2
     goto :final
 )
 
-REM -------------------- Dependency checks --------------------
-call :line
-echo [STEP] Checking Python...
-call :debug "RUN: where python"
-where python >nul 2>&1
-call :debug_errorlevel "where python"
-if errorlevel 1 (
-    echo [ERROR] Python is required for Ultralytics YOLO.
-    echo         Download Python and enable "Add python.exe to PATH" during install.
-    call :fail 4 "Python not installed or not on PATH"
-    goto :final
+echo %RESOLVED_OUTPUT_DIR%| findstr /B "\\\\" >nul 2>&1
+if not errorlevel 1 (
+    set "STATE_UNC_WARNING=1"
+    echo [WARN] Output directory is UNC path. Network latency/permissions may affect export.
 )
-call :debug "RUN: python --version"
-python --version >nul 2>&1
-call :debug_errorlevel "python --version"
-if errorlevel 1 (
-    echo [ERROR] Python command exists but is not working correctly.
-    call :fail 4 "Python not installed or not on PATH"
-    goto :final
-)
-echo [OK] Python is available.
 
-echo [STEP] Checking Ultralytics YOLO CLI ^(yolo^) ...
-call :debug "RUN: where yolo"
-where yolo >nul 2>&1
-call :debug_errorlevel "where yolo"
-if errorlevel 1 (
-    echo [ERROR] Ultralytics YOLO is not installed or not on PATH.
-    echo         Install with: pip install -U ultralytics
-    call :fail 2 "Ultralytics YOLO not installed or not on PATH"
-    goto :final
-)
-call :debug "RUN: yolo version"
-yolo version >nul 2>&1
-call :debug_errorlevel "yolo version"
-if errorlevel 1 (
-    call :debug "RUN: yolo --help"
-    yolo --help >nul 2>&1
-    call :debug_errorlevel "yolo --help"
+if not exist "%RESOLVED_OUTPUT_DIR%" (
+    call :run_cmd "mkdir \"%RESOLVED_OUTPUT_DIR%\"" "mkdir output directory"
     if errorlevel 1 (
-        echo [ERROR] yolo command exists but is not working correctly.
-        call :fail 2 "Ultralytics YOLO command check failed"
+        echo [ERROR] Could not create output directory: "%RESOLVED_OUTPUT_DIR%"
+        call :fail 5 "Failed to create output directory" 2
         goto :final
     )
+)
+
+call :preflight_writable "%RESOLVED_OUTPUT_DIR%"
+if errorlevel 1 goto :final
+
+goto :detect
+
+:detect
+call :line
+echo [STEP] Detecting Python...
+call :detect_python
+if errorlevel 1 goto :final
+echo [OK] Python is available: %STATE_PYTHON_CMD%
+
+if not "%STATE_PYTHON_WHERE%"=="" (
+    call :debug "PATH lookup: %STATE_PYTHON_WHERE%"
+    call :path_len_warn "%STATE_PYTHON_WHERE%" "python"
+)
+
+call :line
+echo [STEP] Checking Ultralytics YOLO CLI ^(yolo^) ...
+where yolo >nul 2>&1
+set "STATE_TMP_RC=%ERRORLEVEL%"
+call :debug "where yolo rc=%STATE_TMP_RC%"
+if not "%STATE_TMP_RC%"=="0" (
+    echo [ERROR] Ultralytics YOLO is not installed or not on PATH.
+    echo         Install with: pip install -U ultralytics
+    call :fail 2 "Ultralytics YOLO not installed or not on PATH" 0
+    goto :final
+)
+for /f "delims=" %%W in ('where yolo 2^>nul') do if not defined STATE_YOLO_WHERE set "STATE_YOLO_WHERE=%%W"
+if not "%STATE_YOLO_WHERE%"=="" call :path_len_warn "%STATE_YOLO_WHERE%" "yolo"
+
+yolo version >nul 2>&1
+set "STATE_TMP_RC=%ERRORLEVEL%"
+if not "%STATE_TMP_RC%"=="0" (
+    echo [ERROR] yolo command exists but is not working correctly.
+    echo         Try: pip install -U ultralytics
+    call :fail 2 "Ultralytics YOLO command check failed" 0
+    goto :final
 )
 echo [OK] YOLO CLI is available.
 
-REM -------------------- Hardware detection (PowerShell in background) --------------------
 call :detect_hardware
 if errorlevel 1 (
-    echo [WARN] Hardware detection unavailable. Continuing without hardware-based suggestion.
+    echo [WARN] Hardware detection unavailable. Using preset suggestion: 3 - Balanced (recommended)
+    set "STATE_SUGGESTED_PRESET=3"
 )
 
-REM -------------------- Preset selection --------------------
-set "PRESET=%RAW_ARG3%"
-if not "%PRESET%"=="" (
-    call :apply_preset "%PRESET%"
-    if errorlevel 1 (
-        echo [WARN] Invalid preset argument "%PRESET%". Falling back to interactive selection.
-        set "PRESET="
-    )
-)
-if "%PRESET%"=="" (
+if "%ARG_PRESET%"=="" (
     call :prompt_preset
     if errorlevel 1 goto :final
-)
-
-if exist "%OUTPUT_ONNX%" (
-    call :line
-    echo [WARN] Output already exists:
-    echo        "%OUTPUT_ONNX%"
-    call :confirm_overwrite
-    if errorlevel 1 goto :final
-)
-if not exist "%OUTPUT_DIR%" (
-    call :debug "RUN: mkdir \"%OUTPUT_DIR%\""
-    mkdir "%OUTPUT_DIR%" >nul 2>&1
-    call :debug_errorlevel "mkdir output directory"
+) else (
+    set "CURRENT_PRESET=%ARG_PRESET%"
+    call :apply_preset "%CURRENT_PRESET%"
     if errorlevel 1 (
-        echo [ERROR] Could not create output directory:
-        echo         "%OUTPUT_DIR%"
-        call :fail 5 "Failed to create output directory"
+        echo [ERROR] Invalid preset argument "%ARG_PRESET%". Use 1, 2, or 3.
+        call :fail 5 "Invalid preset argument" 2
         goto :final
     )
 )
 
-REM -------------------- Export --------------------
-call :line
-echo [PLAN] Input file : "%INPUT_ABS%"
-echo [PLAN] Output file: "%OUTPUT_ONNX%"
-echo [PLAN] Preset     : %PRESET_NAME%
-echo [PLAN] Why        : %PRESET_DESC%
-call :line
-echo [RUN ] Exporting with Ultralytics YOLO...
-echo [RUN ] yolo export model="%INPUT_ABS%" format=onnx imgsz=%IMGSZ%
-call :debug "RUN: yolo export model=\"%INPUT_ABS%\" format=onnx imgsz=%IMGSZ%"
-yolo export model="%INPUT_ABS%" format=onnx imgsz=%IMGSZ%
-set "EXPORT_ERROR=%ERRORLEVEL%"
-call :debug "ERRORLEVEL after export=%EXPORT_ERROR%"
-if not "%EXPORT_ERROR%"=="0" (
-    echo [ERROR] Export command failed with code %EXPORT_ERROR%.
-    call :fail 3 "Export failed"
-    goto :final
+if "%ARG_OUTPUT%"=="" (
+    if "%CURRENT_PRESET%"=="1" set "RESOLVED_OUTPUT=%RESOLVED_INPUT_DIR%%RESOLVED_INPUT_BASE%_best_performance.onnx"
+    if "%CURRENT_PRESET%"=="2" set "RESOLVED_OUTPUT=%RESOLVED_INPUT_DIR%%RESOLVED_INPUT_BASE%_best_detection.onnx"
+    if "%CURRENT_PRESET%"=="3" set "RESOLVED_OUTPUT=%RESOLVED_INPUT_DIR%%RESOLVED_INPUT_BASE%_best_balanced.onnx"
+    for %%O in ("%RESOLVED_OUTPUT%") do (
+        set "RESOLVED_OUTPUT=%%~fO"
+        set "RESOLVED_OUTPUT_DIR=%%~dpO"
+        set "RESOLVED_OUTPUT_NAME=%%~nxO"
+    )
 )
 
-set "GENERATED_ONNX=%INPUT_DIR%%INPUT_BASE%.onnx"
-if not exist "%GENERATED_ONNX%" (
-    echo [ERROR] Export command completed, but expected ONNX file was not created:
-    echo         "%GENERATED_ONNX%"
-    call :fail 3 "Export completed but ONNX file missing"
-    goto :final
-)
-
-if /I "%GENERATED_ONNX%"=="%OUTPUT_ONNX%" (
-    if exist "%OUTPUT_ONNX%" (
-        echo [OK] Conversion complete.
-        call :fail 0 "Success"
-        goto :delete_source_prompt
+if exist "%RESOLVED_OUTPUT%" (
+    if "%STATE_ASSUME_YES%"=="1" (
+        echo [INFO] --yes enabled; removing existing output.
+        if "%STATE_DRY_RUN%"=="1" (
+            echo [RUN ] DRY-RUN del /F /Q "%RESOLVED_OUTPUT%"
+        ) else (
+            del /F /Q "%RESOLVED_OUTPUT%" >nul 2>&1
+            set "STATE_TMP_RC=%ERRORLEVEL%"
+            if not "%STATE_TMP_RC%"=="0" (
+                echo [ERROR] Could not remove existing output file: "%RESOLVED_OUTPUT%"
+                call :fail 5 "Cannot overwrite existing output file" 2
+                goto :final
+            )
+        )
     ) else (
-        echo [ERROR] Export reported success, but output is not present at expected path.
-        call :fail 3 "ONNX output missing after export"
-        goto :final
+        call :validate_input "Overwrite existing output file? [y/N/C]: " "N" "Y N C" "3" "OVERWRITE_CHOICE"
+        if errorlevel 1 goto :final
+        if /I "%OVERWRITE_CHOICE%"=="C" (
+            call :fail 5 "User canceled because output already exists" 1
+            goto :final
+        )
+        if /I "%OVERWRITE_CHOICE%"=="Y" (
+            if "%STATE_DRY_RUN%"=="1" (
+                echo [RUN ] DRY-RUN del /F /Q "%RESOLVED_OUTPUT%"
+            ) else (
+                del /F /Q "%RESOLVED_OUTPUT%" >nul 2>&1
+                set "STATE_TMP_RC=%ERRORLEVEL%"
+                if not "%STATE_TMP_RC%"=="0" (
+                    echo [ERROR] Could not remove existing output file: "%RESOLVED_OUTPUT%"
+                    call :fail 5 "Cannot overwrite existing output file" 2
+                    goto :final
+                )
+            )
+        ) else (
+            call :fail 5 "User canceled overwrite" 1
+            goto :final
+        )
     )
 )
 
-if exist "%OUTPUT_ONNX%" (
-    echo [WARN] Target ONNX exists unexpectedly before move: "%OUTPUT_ONNX%"
+goto :export
+
+:export
+call :line
+echo [PLAN] Input file : "%RESOLVED_INPUT%"
+echo [PLAN] Output file: "%RESOLVED_OUTPUT%"
+echo [PLAN] Preset     : %CURRENT_PRESET_NAME%
+echo [PLAN] Why        : %CURRENT_PRESET_DESC%
+if "%STATE_HW_DETECTED%"=="1" (
+    if not "%STATE_HW_GPU%"=="" echo [INFO] GPU: %STATE_HW_GPU%
+    if not "%STATE_HW_CPU%"=="" echo [INFO] CPU: %STATE_HW_CPU%
+    if not "%STATE_HW_RAM_GB%"=="" echo [INFO] RAM: %STATE_HW_RAM_GB% GB
 )
-call :debug "RUN: move /Y \"%GENERATED_ONNX%\" \"%OUTPUT_ONNX%\""
-move /Y "%GENERATED_ONNX%" "%OUTPUT_ONNX%" >nul 2>&1
-call :debug_errorlevel "move generated onnx"
-if errorlevel 1 (
-    echo [ERROR] Could not move generated ONNX file to requested output path.
-    echo         Source: "%GENERATED_ONNX%"
-    echo         Target: "%OUTPUT_ONNX%"
-    call :fail 3 "ONNX generated but could not be moved"
-    goto :final
+if "%STATE_DRY_RUN%"=="1" (
+    echo [INFO] DRY-RUN mode is ON. No export/delete/move operations will execute.
 )
-if not exist "%OUTPUT_ONNX%" (
-    echo [ERROR] Move command returned success, but output file is missing:
-    echo         "%OUTPUT_ONNX%"
-    call :fail 3 "Output ONNX missing after move"
-    goto :final
+call :line
+
+set "RESOLVED_GENERATED_ONNX=%RESOLVED_INPUT_DIR%%RESOLVED_INPUT_BASE%.onnx"
+if "%STATE_DRY_RUN%"=="1" (
+    echo [RUN ] DRY-RUN yolo export model="%RESOLVED_INPUT%" format=onnx imgsz=%CURRENT_IMGSZ%
+    if /I not "%RESOLVED_GENERATED_ONNX%"=="%RESOLVED_OUTPUT%" (
+        echo [RUN ] DRY-RUN move /Y "%RESOLVED_GENERATED_ONNX%" "%RESOLVED_OUTPUT%"
+    )
+    echo [OK] DRY-RUN complete. Validation passed.
+    call :fail 0 "Dry-run success" 0
+    goto :cleanup
+)
+
+echo [RUN ] Exporting with Ultralytics YOLO...
+echo [RUN ] yolo export model="%RESOLVED_INPUT%" format=onnx imgsz=%CURRENT_IMGSZ%
+yolo export model="%RESOLVED_INPUT%" format=onnx imgsz=%CURRENT_IMGSZ%
+set "STATE_EXPORT_RC=%ERRORLEVEL%"
+if not "%STATE_EXPORT_RC%"=="0" (
+    if exist "%RESOLVED_GENERATED_ONNX%" del /F /Q "%RESOLVED_GENERATED_ONNX%" >nul 2>&1
+    echo [ERROR] Export command failed with code %STATE_EXPORT_RC%.
+    echo         Manual retry:
+    echo         yolo export model="%RESOLVED_INPUT%" format=onnx imgsz=%CURRENT_IMGSZ%
+    call :fail 3 "Export failed" 0
+    goto :cleanup
+)
+
+if not exist "%RESOLVED_GENERATED_ONNX%" (
+    echo [ERROR] Export completed, but ONNX was not created: "%RESOLVED_GENERATED_ONNX%"
+    call :fail 3 "Export completed but ONNX file missing" 0
+    goto :cleanup
+)
+
+if /I not "%RESOLVED_GENERATED_ONNX%"=="%RESOLVED_OUTPUT%" (
+    move /Y "%RESOLVED_GENERATED_ONNX%" "%RESOLVED_OUTPUT%" >nul 2>&1
+    set "STATE_MOVE_RC=%ERRORLEVEL%"
+    if not "%STATE_MOVE_RC%"=="0" (
+        echo [ERROR] Could not move generated ONNX file to requested output path.
+        echo         File remains at "%RESOLVED_GENERATED_ONNX%"
+        call :fail 3 "ONNX generated but could not be moved" 0
+        goto :cleanup
+    )
+)
+
+if not exist "%RESOLVED_OUTPUT%" (
+    echo [ERROR] Output ONNX missing after export/move: "%RESOLVED_OUTPUT%"
+    call :fail 3 "Output ONNX missing after move" 0
+    goto :cleanup
 )
 
 echo [OK] Conversion complete.
-call :fail 0 "Success"
 
-:delete_source_prompt
-set "DELETE_CHOICE="
-set /p DELETE_CHOICE="[INPUT] Delete source .pt model after successful conversion? [y/N]: "
-if "%DELETE_CHOICE%"=="" set "DELETE_CHOICE=N"
+if "%STATE_ASSUME_YES%"=="1" (
+    set "DELETE_CHOICE=Y"
+) else (
+    call :validate_input "Delete source .pt model after successful conversion? [y/N/C]: " "N" "Y N C" "3" "DELETE_CHOICE"
+    if errorlevel 1 goto :cleanup
+)
+
+if /I "%DELETE_CHOICE%"=="C" (
+    call :fail 5 "User canceled at delete prompt" 1
+    goto :cleanup
+)
 if /I "%DELETE_CHOICE%"=="Y" (
-    call :debug "RUN: del /F /Q \"%INPUT_ABS%\""
-    del /F /Q "%INPUT_ABS%" >nul 2>&1
-    call :debug_errorlevel "delete source pt"
-    if errorlevel 1 (
-        echo [WARN] Could not delete source model: "%INPUT_ABS%"
+    del /F /Q "%RESOLVED_INPUT%" >nul 2>&1
+    set "STATE_DELETE_RC=%ERRORLEVEL%"
+    if not "%STATE_DELETE_RC%"=="0" (
+        echo [WARN] Could not delete source model.
+        echo        File remains at "%RESOLVED_INPUT%"
     ) else (
-        if exist "%INPUT_ABS%" (
-            echo [WARN] Source model still exists after delete attempt: "%INPUT_ABS%"
+        if exist "%RESOLVED_INPUT%" (
+            echo [WARN] Delete reported success but file remains at "%RESOLVED_INPUT%"
         ) else (
             echo [INFO] Source model deleted.
         )
     )
-    goto :final
 )
-if /I "%DELETE_CHOICE%"=="N" goto :final
-echo [WARN] Invalid choice. Keeping source model.
+
+if "%STATE_EXIT_CODE%"=="0" call :fail 0 "Success" 0
+
+goto :cleanup
+
+:cleanup
+if defined STATE_TEMP_FILE (
+    if exist "%STATE_TEMP_FILE%" del /F /Q "%STATE_TEMP_FILE%" >nul 2>&1
+)
 goto :final
 
-:select_input_model
-set "PT_COUNT=0"
-for /f "delims=" %%F in ('dir /b /a:-d "%~dp0*.pt" 2^>nul') do (
-    set /a PT_COUNT+=1
-    set "PT_FILE_!PT_COUNT!=%%F"
+:final
+set "STATE_LAST_ERRORLEVEL=%ERRORLEVEL%"
+call :line
+echo SUMMARY
+echo   Input file          : "%RESOLVED_INPUT%"
+echo   Output file         : "%RESOLVED_OUTPUT%"
+echo   Optimization preset : %CURRENT_PRESET_NAME% ^(imgsz=%CURRENT_IMGSZ%^)
+if "%STATE_HW_DETECTED%"=="1" (
+    if not "%STATE_HW_GPU%"=="" echo   Hardware GPU       : %STATE_HW_GPU%
+    if not "%STATE_HW_CPU%"=="" echo   Hardware CPU       : %STATE_HW_CPU%
+    if not "%STATE_HW_RAM_GB%"=="" echo   Hardware RAM ^(GB^)  : %STATE_HW_RAM_GB%
 )
-if "%PT_COUNT%"=="0" (
-    echo [ERROR] No .pt files were found next to this script:
-    echo         "%~dp0"
-    echo         Place a .pt model next to this script or pass a full path as arg1.
-    call :fail 1 "No input .pt found"
-    exit /b 1
+if "%STATE_UNC_WARNING%"=="1" echo   Warning             : UNC path detected
+if "%STATE_READONLY_WARNING%"=="1" echo   Warning             : Read-only/permission risk detected
+echo   Exit status         : %STATE_EXIT_REASON%
+if "%STATE_EXIT_CODE%"=="5" echo   Exit code detail     : 5.%STATE_EXIT_SUBCODE%
+echo   Exit code           : %STATE_EXIT_CODE%
+echo   Final ERRORLEVEL    : %STATE_LAST_ERRORLEVEL%
+call :line
+
+call :log "input=%RESOLVED_INPUT%"
+call :log "output=%RESOLVED_OUTPUT%"
+call :log "preset=%CURRENT_PRESET% imgsz=%CURRENT_IMGSZ% name=%CURRENT_PRESET_NAME%"
+call :log "gpu=%STATE_HW_GPU% cpu=%STATE_HW_CPU% ram=%STATE_HW_RAM_GB%"
+call :log "export_rc=%STATE_EXPORT_RC% move_rc=%STATE_MOVE_RC% delete_rc=%STATE_DELETE_RC%"
+call :log "exit_code=%STATE_EXIT_CODE% exit_subcode=%STATE_EXIT_SUBCODE% exit_reason=%STATE_EXIT_REASON%"
+
+if "%STATE_DID_PUSHD%"=="1" popd >nul 2>&1
+endlocal & exit /b %STATE_EXIT_CODE%
+
+:detect_python
+set "STATE_PYTHON_CMD="
+set "STATE_PYTHON_WHERE="
+
+py -3 --version >nul 2>&1
+if "%ERRORLEVEL%"=="0" (
+    set "STATE_PYTHON_CMD=py -3"
+    for /f "delims=" %%W in ('where py 2^>nul') do if not defined STATE_PYTHON_WHERE set "STATE_PYTHON_WHERE=%%W"
+    exit /b 0
 )
-if "%PT_COUNT%"=="1" (
-    set "INPUT_PT=%~dp0!PT_FILE_1!"
-    echo [INFO] Using detected model: "!PT_FILE_1!"
+python3 --version >nul 2>&1
+if "%ERRORLEVEL%"=="0" (
+    set "STATE_PYTHON_CMD=python3"
+    for /f "delims=" %%W in ('where python3 2^>nul') do if not defined STATE_PYTHON_WHERE set "STATE_PYTHON_WHERE=%%W"
+    exit /b 0
+)
+python --version >nul 2>&1
+if "%ERRORLEVEL%"=="0" (
+    set "STATE_PYTHON_CMD=python"
+    for /f "delims=" %%W in ('where python 2^>nul') do if not defined STATE_PYTHON_WHERE set "STATE_PYTHON_WHERE=%%W"
     exit /b 0
 )
 
-set "MODEL_TRIES=0"
-:select_model_prompt
-set /a MODEL_TRIES+=1
-call :line
-echo [INFO] Multiple .pt files found next to this script:
-for /L %%N in (1,1,%PT_COUNT%) do echo        [%%N] !PT_FILE_%%N!
-set "MODEL_CHOICE="
-set /p MODEL_CHOICE="[INPUT] Select the model to convert by number, or press Enter to cancel: "
-if "%MODEL_CHOICE%"=="" (
-    echo [INFO] Operation canceled by user.
-    call :fail 5 "User canceled model selection"
-    exit /b 1
-)
-echo(%MODEL_CHOICE%| findstr /R "^[0-9][0-9]*$" >nul
-if errorlevel 1 (
-    echo [WARN] Invalid selection. Enter a number between 1 and %PT_COUNT%.
-    if %MODEL_TRIES% GEQ 3 (
-        call :fail 5 "User entered invalid model selection repeatedly"
-        exit /b 1
-    )
-    goto :select_model_prompt
-)
-set /a MODEL_INDEX=%MODEL_CHOICE% >nul 2>&1
-if errorlevel 1 (
-    echo [WARN] Invalid selection. Enter a valid number.
-    if %MODEL_TRIES% GEQ 3 (
-        call :fail 5 "User entered invalid model selection repeatedly"
-        exit /b 1
-    )
-    goto :select_model_prompt
-)
-if %MODEL_INDEX% LSS 1 (
-    echo [WARN] Invalid selection. Enter a number between 1 and %PT_COUNT%.
-    if %MODEL_TRIES% GEQ 3 (
-        call :fail 5 "User entered invalid model selection repeatedly"
-        exit /b 1
-    )
-    goto :select_model_prompt
-)
-if %MODEL_INDEX% GTR %PT_COUNT% (
-    echo [WARN] Invalid selection. Enter a number between 1 and %PT_COUNT%.
-    if %MODEL_TRIES% GEQ 3 (
-        call :fail 5 "User entered invalid model selection repeatedly"
-        exit /b 1
-    )
-    goto :select_model_prompt
-)
-call set "INPUT_PT=%%~dp0%%PT_FILE_%MODEL_INDEX%%%"
-if "%INPUT_PT%"=="" (
-    echo [ERROR] Failed to resolve selected model.
-    call :fail 5 "Invalid model selection"
-    exit /b 1
-)
-echo [INFO] Using selected model: "!PT_FILE_%MODEL_INDEX%!"
-exit /b 0
+echo [ERROR] Python is required for Ultralytics YOLO.
+echo         Install Python and enable "Add python.exe to PATH" during setup.
+call :fail 4 "Python not installed or not on PATH" 0
+exit /b 1
 
 :detect_hardware
-set "GPU_NAME="
-set "CPU_NAME="
-set "RAM_GB="
-set "HARDWARE_DETECTED=0"
-set "SUGGESTED_PRESET=3"
-set "SUGGESTED_PRESET_NAME=3 - Balanced (recommended)"
+set "STATE_HW_DETECTED=0"
+set "STATE_HW_GPU="
+set "STATE_HW_CPU="
+set "STATE_HW_RAM_GB="
 
-call :debug "RUN: where powershell"
 where powershell >nul 2>&1
-call :debug_errorlevel "where powershell"
 if errorlevel 1 exit /b 1
 
-for /f "usebackq delims=" %%G in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; (Get-CimInstance Win32_VideoController ^| Select-Object -First 1 -ExpandProperty Name)" 2^>nul`) do if not defined GPU_NAME set "GPU_NAME=%%G"
-for /f "usebackq delims=" %%C in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; (Get-CimInstance Win32_Processor ^| Select-Object -First 1 -ExpandProperty Name)" 2^>nul`) do if not defined CPU_NAME set "CPU_NAME=%%C"
-for /f "usebackq delims=" %%R in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; ([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB))" 2^>nul`) do if not defined RAM_GB set "RAM_GB=%%R"
+for /f "usebackq delims=" %%G in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; Get-CimInstance Win32_VideoController ^| Select-Object -First 1 -Expand Name" 2^>nul`) do if not defined STATE_HW_GPU set "STATE_HW_GPU=%%G"
+for /f "usebackq delims=" %%C in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; Get-CimInstance Win32_Processor ^| Select-Object -First 1 -Expand Name" 2^>nul`) do if not defined STATE_HW_CPU set "STATE_HW_CPU=%%C"
+for /f "usebackq delims=" %%R in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB)" 2^>nul`) do if not defined STATE_HW_RAM_GB set "STATE_HW_RAM_GB=%%R"
 
-if defined GPU_NAME set "HARDWARE_DETECTED=1"
-if defined CPU_NAME set "HARDWARE_DETECTED=1"
-if defined RAM_GB set "HARDWARE_DETECTED=1"
-if "%HARDWARE_DETECTED%"=="0" exit /b 1
+if defined STATE_HW_GPU set "STATE_HW_DETECTED=1"
+if defined STATE_HW_CPU set "STATE_HW_DETECTED=1"
+if defined STATE_HW_RAM_GB set "STATE_HW_DETECTED=1"
+if "%STATE_HW_DETECTED%"=="0" exit /b 1
 
-set "IS_HIGH_GPU=0"
-set "IS_LOW_GPU=0"
-set "RAM_NUM="
-if defined GPU_NAME (
-    echo !GPU_NAME! | find /I "RTX" >nul && set "IS_HIGH_GPU=1"
-    echo !GPU_NAME! | find /I "RX 6" >nul && set "IS_HIGH_GPU=1"
-    echo !GPU_NAME! | find /I "RX 7" >nul && set "IS_HIGH_GPU=1"
-    echo !GPU_NAME! | find /I "ARC A" >nul && set "IS_HIGH_GPU=1"
+set "STATE_SUGGESTED_PRESET=3"
 
-    echo !GPU_NAME! | find /I "Intel(R) UHD" >nul && set "IS_LOW_GPU=1"
-    echo !GPU_NAME! | find /I "UHD" >nul && set "IS_LOW_GPU=1"
-    echo !GPU_NAME! | find /I "HD Graphics" >nul && set "IS_LOW_GPU=1"
-    echo !GPU_NAME! | find /I "Iris" >nul && set "IS_LOW_GPU=1"
-    echo !GPU_NAME! | find /I "Vega 3" >nul && set "IS_LOW_GPU=1"
-    echo !GPU_NAME! | find /I "Vega 5" >nul && set "IS_LOW_GPU=1"
-    echo !GPU_NAME! | find /I "Vega 6" >nul && set "IS_LOW_GPU=1"
-    echo !GPU_NAME! | find /I "Vega 7" >nul && set "IS_LOW_GPU=1"
-    echo !GPU_NAME! | find /I "Vega 8" >nul && set "IS_LOW_GPU=1"
+echo %STATE_HW_GPU%| find /I "RTX" >nul && set "STATE_SUGGESTED_PRESET=2"
+if "%STATE_SUGGESTED_PRESET%"=="3" echo %STATE_HW_GPU%| find /I "Intel" >nul && set "STATE_SUGGESTED_PRESET=1"
+if "%STATE_SUGGESTED_PRESET%"=="3" echo %STATE_HW_GPU%| find /I "UHD" >nul && set "STATE_SUGGESTED_PRESET=1"
+if not "%STATE_HW_RAM_GB%"=="" (
+    set /a STATE_RAM_NUM=%STATE_HW_RAM_GB%+0 >nul 2>&1
+    if not errorlevel 1 (
+        if %STATE_RAM_NUM% LSS 8 set "STATE_SUGGESTED_PRESET=1"
+        if %STATE_RAM_NUM% GEQ 16 if not "%STATE_SUGGESTED_PRESET%"=="1" echo %STATE_HW_GPU%| find /I "RTX" >nul && set "STATE_SUGGESTED_PRESET=2"
+    )
 )
-if defined RAM_GB (
-    set /a RAM_NUM=RAM_GB+0 >nul 2>&1
-    if errorlevel 1 set "RAM_NUM="
-)
-if defined RAM_NUM if !RAM_NUM! LSS 8 set "SUGGESTED_PRESET=1"
-if "%SUGGESTED_PRESET%"=="3" if "%IS_LOW_GPU%"=="1" set "SUGGESTED_PRESET=1"
-if "%SUGGESTED_PRESET%"=="3" if "%IS_HIGH_GPU%"=="1" if defined RAM_NUM if !RAM_NUM! GEQ 16 set "SUGGESTED_PRESET=2"
 
-call :apply_preset "%SUGGESTED_PRESET%" >nul 2>&1
-if errorlevel 1 (
-    set "SUGGESTED_PRESET=3"
-    call :apply_preset "3" >nul 2>&1
-)
-set "SUGGESTED_PRESET_NAME=%PRESET_NAME%"
-call :debug "Detected GPU=!GPU_NAME!"
-call :debug "Detected CPU=!CPU_NAME!"
-call :debug "Detected RAM_GB=!RAM_GB!"
-call :debug "Suggested preset=!SUGGESTED_PRESET!"
 exit /b 0
 
 :prompt_preset
-set "PRESET_TRIES=0"
-:preset_prompt
-set /a PRESET_TRIES+=1
 call :line
-echo [INFO] Select optimization preset ^(Balanced is recommended^):
-if "%HARDWARE_DETECTED%"=="1" (
-    if defined GPU_NAME echo [INFO] Detected GPU: !GPU_NAME!
-    if defined CPU_NAME echo [INFO] Detected CPU: !CPU_NAME!
-    if defined RAM_GB (echo [INFO] Detected RAM: !RAM_GB! GB) else echo [INFO] Detected RAM: Unknown
-    echo [INFO] Suggested preset based on your system: !SUGGESTED_PRESET_NAME!
-) else (
-    echo [INFO] Hardware detection unavailable. Using default suggestion: 3 - Balanced (recommended)
-    set "SUGGESTED_PRESET=3"
+echo [INFO] Select optimization preset ^(Balanced is recommended^)
+if "%STATE_HW_DETECTED%"=="1" (
+    if not "%STATE_HW_GPU%"=="" echo [INFO] Detected GPU: %STATE_HW_GPU%
+    if not "%STATE_HW_CPU%"=="" echo [INFO] Detected CPU: %STATE_HW_CPU%
+    if not "%STATE_HW_RAM_GB%"=="" echo [INFO] Detected RAM: %STATE_HW_RAM_GB% GB
 )
-echo        [1] Best performance - faster, potentially lower detection quality
-echo        [2] Best detection   - slower, potentially better detection quality
-echo        [3] Balanced         - recommended for most users
-set "PRESET_INPUT="
-set /p PRESET_INPUT="[INPUT] Enter 1, 2, or 3 [default !SUGGESTED_PRESET!]: "
-if "%PRESET_INPUT%"=="" (
-    set "PRESET=!SUGGESTED_PRESET!"
-) else (
-    set "PRESET=%PRESET_INPUT%"
-)
-call :apply_preset "%PRESET%"
+echo [INFO] Suggested preset: %STATE_SUGGESTED_PRESET%
+echo        [1] Best performance - faster, lower compute
+
+echo        [2] Best detection   - higher quality, slower
+echo        [3] Balanced         - recommended
+call :validate_input "Enter 1, 2, or 3 [default %STATE_SUGGESTED_PRESET%]: " "%STATE_SUGGESTED_PRESET%" "1 2 3" "3" "CURRENT_PRESET"
+if errorlevel 1 exit /b 1
+call :apply_preset "%CURRENT_PRESET%"
 if errorlevel 1 (
-    echo [WARN] Invalid preset. Please enter 1, 2, or 3.
-    if %PRESET_TRIES% GEQ 3 (
-        call :fail 5 "User entered invalid preset repeatedly"
-        exit /b 1
-    )
-    goto :preset_prompt
+    call :fail 5 "Invalid preset selection" 2
+    exit /b 1
 )
 exit /b 0
 
 :apply_preset
-set "PRESET=%~1"
-if "%PRESET%"=="1" (
-    set "IMGSZ=640"
-    set "PRESET_NAME=1 - Best performance"
-    set "PRESET_DESC=Smaller image size for faster runtime, with potential quality tradeoff"
+if "%~1"=="1" (
+    set "CURRENT_PRESET=1"
+    set "CURRENT_IMGSZ=640"
+    set "CURRENT_PRESET_NAME=1 - Best performance"
+    set "CURRENT_PRESET_DESC=Smaller image size for faster runtime"
     exit /b 0
 )
-if "%PRESET%"=="2" (
-    set "IMGSZ=1280"
-    set "PRESET_NAME=2 - Best detection"
-    set "PRESET_DESC=Larger image size for potentially better detection, with slower runtime"
+if "%~1"=="2" (
+    set "CURRENT_PRESET=2"
+    set "CURRENT_IMGSZ=1280"
+    set "CURRENT_PRESET_NAME=2 - Best detection"
+    set "CURRENT_PRESET_DESC=Larger image size for better potential accuracy"
     exit /b 0
 )
-if "%PRESET%"=="3" (
-    set "IMGSZ=960"
-    set "PRESET_NAME=3 - Balanced (recommended)"
-    set "PRESET_DESC=Balanced speed and detection quality for most users"
+if "%~1"=="3" (
+    set "CURRENT_PRESET=3"
+    set "CURRENT_IMGSZ=960"
+    set "CURRENT_PRESET_NAME=3 - Balanced (recommended)"
+    set "CURRENT_PRESET_DESC=Balanced speed and detection quality for most users"
     exit /b 0
 )
 exit /b 1
 
-:confirm_overwrite
-set "OVERWRITE_TRIES=0"
-:overwrite_prompt
-set /a OVERWRITE_TRIES+=1
-set "OVERWRITE_CHOICE="
-set /p OVERWRITE_CHOICE="[INPUT] Overwrite existing output file? [y/N]: "
-if "%OVERWRITE_CHOICE%"=="" set "OVERWRITE_CHOICE=N"
-if /I "%OVERWRITE_CHOICE%"=="Y" (
-    call :debug "RUN: del /F /Q \"%OUTPUT_ONNX%\""
-    del /F /Q "%OUTPUT_ONNX%" >nul 2>&1
-    call :debug_errorlevel "delete existing output"
-    if errorlevel 1 (
-        echo [ERROR] Could not remove existing output file.
-        call :fail 5 "Cannot overwrite existing output file"
-        exit /b 1
-    )
-    if exist "%OUTPUT_ONNX%" (
-        echo [ERROR] Existing output file still present after delete attempt.
-        call :fail 5 "Cannot overwrite existing output file"
-        exit /b 1
-    )
-    exit /b 0
+:select_input_model
+setlocal EnableDelayedExpansion
+set "STATE_PT_COUNT=0"
+for /f "delims=" %%F in ('dir /b /a:-d "%~dp0*.pt" 2^>nul') do (
+    set /a STATE_PT_COUNT+=1
+    set "STATE_PT_FILE_!STATE_PT_COUNT!=%%F"
 )
-if /I "%OVERWRITE_CHOICE%"=="N" (
-    echo [INFO] Operation canceled by user.
-    call :fail 5 "User canceled because output already exists"
+
+if "!STATE_PT_COUNT!"=="0" (
+    endlocal
+    echo [ERROR] No .pt files found next to this script.
+    call :missing_pt_help
+    call :fail 1 "No input .pt found" 0
     exit /b 1
 )
-echo [WARN] Invalid choice. Enter Y or N.
-if %OVERWRITE_TRIES% GEQ 3 (
-    call :fail 5 "User entered invalid overwrite choice repeatedly"
+if "!STATE_PT_COUNT!"=="1" (
+    for %%Q in ("%~dp0!STATE_PT_FILE_1!") do endlocal & set "RESOLVED_INPUT=%%~fQ" & echo [INFO] Using: %%~nxQ & exit /b 0
+)
+
+call :line
+echo [INFO] Multiple .pt files found:
+for /L %%N in (1,1,!STATE_PT_COUNT!) do echo        [%%N] !STATE_PT_FILE_%%N!
+echo        [C] Cancel
+
+set "STATE_SELECT_TRY=0"
+:select_loop
+set /a STATE_SELECT_TRY+=1
+set "STATE_CHOICE="
+set /p STATE_CHOICE=[INPUT] Select model number [1-!STATE_PT_COUNT!] or C: 
+if "!STATE_CHOICE!"=="" set "STATE_CHOICE=C"
+if /I "!STATE_CHOICE!"=="C" (
+    endlocal
+    call :fail 5 "User canceled model selection" 1
     exit /b 1
 )
-goto :overwrite_prompt
+echo(!STATE_CHOICE!| findstr /R "^[0-9][0-9]*$" >nul 2>&1
+if errorlevel 1 (
+    echo [WARN] Invalid selection.
+    if !STATE_SELECT_TRY! GEQ 3 (
+        endlocal
+        call :fail 5 "Invalid model selection attempts exceeded" 2
+        exit /b 1
+    )
+    goto :select_loop
+)
+set /a STATE_NUM=!STATE_CHOICE! >nul 2>&1
+if !STATE_NUM! LSS 1 goto :select_bad
+if !STATE_NUM! GTR !STATE_PT_COUNT! goto :select_bad
+call set "STATE_PICK=%%STATE_PT_FILE_!STATE_NUM!%%"
+for %%Q in ("%~dp0!STATE_PICK!") do endlocal & set "RESOLVED_INPUT=%%~fQ" & echo [INFO] Using: %%~nxQ & exit /b 0
+
+:select_bad
+echo [WARN] Selection out of range.
+if !STATE_SELECT_TRY! GEQ 3 (
+    endlocal
+    call :fail 5 "Invalid model selection attempts exceeded" 2
+    exit /b 1
+)
+goto :select_loop
+
+:preflight_writable
+set "STATE_TEMP_FILE=%~1convert_write_test_%RANDOM%_%RANDOM%.tmp"
+call :debug "Preflight write test at %STATE_TEMP_FILE%"
+(echo test)>"%STATE_TEMP_FILE%" 2>nul
+if errorlevel 1 (
+    echo [ERROR] Output directory is not writable: "%~1"
+    echo         Check permissions, free disk space, and folder attributes.
+    set "STATE_READONLY_WARNING=1"
+    call :fail 5 "Output directory is not writable (disk full or permission denied)" 2
+    exit /b 1
+)
+del /F /Q "%STATE_TEMP_FILE%" >nul 2>&1
+if errorlevel 1 (
+    echo [WARN] Temporary preflight file could not be deleted: "%STATE_TEMP_FILE%"
+    echo        File remains at "%STATE_TEMP_FILE%"
+)
+exit /b 0
+
+:validate_input
+setlocal EnableDelayedExpansion
+set "STATE_PROMPT=%~1"
+set "STATE_DEFAULT=%~2"
+set "STATE_ALLOWED=%~3"
+set "STATE_MAX=%~4"
+set "STATE_OUTVAR=%~5"
+set "STATE_TRIES=0"
+:validate_input_loop
+set /a STATE_TRIES+=1
+set "STATE_VAL="
+set /p STATE_VAL=!STATE_PROMPT!
+if "!STATE_VAL!"=="" set "STATE_VAL=!STATE_DEFAULT!"
+if /I "!STATE_VAL!"=="C" (
+    endlocal
+    call :fail 5 "User canceled" 1
+    exit /b 1
+)
+set "STATE_OK=0"
+for %%A in (!STATE_ALLOWED!) do (
+    if /I "%%A"=="!STATE_VAL!" set "STATE_OK=1"
+)
+if "!STATE_OK!"=="1" (
+    endlocal & set "%~5=%STATE_VAL%" & exit /b 0
+)
+echo [WARN] Invalid input: "!STATE_VAL!"
+if !STATE_TRIES! GEQ !STATE_MAX! (
+    endlocal
+    call :fail 5 "Invalid input attempts exceeded" 2
+    exit /b 1
+)
+goto :validate_input_loop
+
+:run_cmd
+call :debug "RUN: %~1"
+cmd /d /c "%~1" >nul 2>&1
+set "STATE_TMP_RC=%ERRORLEVEL%"
+if not "%STATE_TMP_RC%"=="0" (
+    call :debug "%~2 failed rc=%STATE_TMP_RC%"
+    exit /b 1
+)
+exit /b 0
+
+:path_len_warn
+set "STATE_PATH_CHECK=%~1"
+set "STATE_LABEL=%~2"
+call set "STATE_PATH_LEN=%%STATE_PATH_CHECK%%"
+if not "%STATE_PATH_LEN:~240,1%"=="" (
+    echo [WARN] %STATE_LABEL% resolved path appears very long. PATH truncation may occur on some systems.
+)
+exit /b 0
 
 :init_logging
-set "LOG_DIR=%~dp0logs"
-set "LOG_FILE=%LOG_DIR%\convert_to_onnx.log"
-if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>&1
-if not exist "%LOG_DIR%" (
-    echo [WARN] Logging disabled: could not create log directory "%LOG_DIR%".
-    set "LOG_ENABLED=0"
-    exit /b 0
-)
->>"%LOG_FILE%" echo.
-if errorlevel 1 (
-    echo [WARN] Logging disabled: could not write log file "%LOG_FILE%".
-    set "LOG_ENABLED=0"
-    exit /b 0
-)
-set "LOG_ENABLED=1"
+if "%STATE_VERBOSE%"=="0" exit /b 0
+set "STATE_LOG_DIR=%~dp0logs"
+if not exist "%STATE_LOG_DIR%" mkdir "%STATE_LOG_DIR%" >nul 2>&1
+if not exist "%STATE_LOG_DIR%" exit /b 0
+
+set "STATE_LOG_DATE="
+for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd" 2^>nul`) do if not defined STATE_LOG_DATE set "STATE_LOG_DATE=%%D"
+if "%STATE_LOG_DATE%"=="" set "STATE_LOG_DATE=%date:/=-%"
+set "STATE_LOG_FILE=%STATE_LOG_DIR%\convert_to_onnx_%STATE_LOG_DATE%.log"
+>>"%STATE_LOG_FILE%" echo [%date% %time%] session start
+if errorlevel 1 exit /b 0
+set "STATE_LOG_ENABLED=1"
 exit /b 0
 
 :log
-if not "%LOG_ENABLED%"=="1" exit /b 0
-set "LOG_TEXT=%~1"
->>"%LOG_FILE%" echo [%date% %time%] %LOG_TEXT%
-if errorlevel 1 echo [WARN] Failed to append to log file.
+if "%STATE_LOG_ENABLED%"=="0" exit /b 0
+>>"%STATE_LOG_FILE%" echo [%date% %time%] %~1
 exit /b 0
 
 :debug
-if not "%DEBUG_MODE%"=="1" exit /b 0
+if "%STATE_VERBOSE%"=="0" exit /b 0
 echo [INFO] [DEBUG] %~1
-call :log "DEBUG: %~1"
+call :log "DEBUG %~1"
 exit /b 0
 
-:debug_errorlevel
-if not "%DEBUG_MODE%"=="1" exit /b 0
-echo [INFO] [DEBUG] ERRORLEVEL after %~1 = %ERRORLEVEL%
-call :log "DEBUG: ERRORLEVEL after %~1 = %ERRORLEVEL%"
+:missing_pt_help
+echo         Fixes:
+echo         1^) Place a .pt file next to this script.
+echo         2^) Pass full path as arg1.
+echo         3^) Verify the file extension is exactly .pt.
 exit /b 0
 
 :fail
-set "EXIT_CODE=%~1"
-set "EXIT_REASON=%~2"
+set "STATE_EXIT_CODE=%~1"
+set "STATE_EXIT_REASON=%~2"
+if "%~3"=="" (
+    if "%STATE_EXIT_CODE%"=="5" set "STATE_EXIT_SUBCODE=2"
+) else (
+    set "STATE_EXIT_SUBCODE=%~3"
+)
 exit /b 0
 
 :line
@@ -589,27 +726,3 @@ exit /b 0
 :title
 echo %~1
 exit /b 0
-
-:final
-set "LAST_ERRORLEVEL=%ERRORLEVEL%"
-call :line
-echo SUMMARY
-echo   Input file          : "%INPUT_ABS%"
-echo   Output file         : "%OUTPUT_ONNX%"
-echo   Optimization preset : %PRESET_NAME% ^(imgsz=%IMGSZ%^)
-if "%HARDWARE_DETECTED%"=="1" (
-    echo   Hardware GPU       : %GPU_NAME%
-    echo   Hardware CPU       : %CPU_NAME%
-    echo   Hardware RAM ^(GB^)  : %RAM_GB%
-)
-echo   Exit status         : %EXIT_REASON%
-echo   Exit code           : %EXIT_CODE%
-echo   Final ERRORLEVEL    : %LAST_ERRORLEVEL%
-call :line
-call :log "Input=%INPUT_ABS%"
-call :log "Output=%OUTPUT_ONNX%"
-call :log "Preset=%PRESET_NAME% imgsz=%IMGSZ%"
-call :log "GPU=%GPU_NAME% CPU=%CPU_NAME% RAM_GB=%RAM_GB%"
-call :log "ExitCode=%EXIT_CODE% ExitReason=%EXIT_REASON% FinalErrorlevel=%LAST_ERRORLEVEL%"
-if "%DID_PUSHD%"=="1" popd >nul 2>&1
-endlocal & exit /b %EXIT_CODE%
