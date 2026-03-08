@@ -1,11 +1,15 @@
 @echo off
-REM === INTERACTIVE BOOTSTRAP: no args -> interactive in same window ===
-set "BOOTSTRAP_INTERACTIVE=0"
+REM === SELF-LAUNCH: Opens CMD window + runs interactive ===
+if defined AUTOMATED_MODE goto :main
 if /I "%~1"=="--interactive" (
-    set "BOOTSTRAP_INTERACTIVE=1"
+    set "AUTOMATED_MODE=1"
     shift
+    goto :main
 )
-if "%~1"=="" if "%BOOTSTRAP_INTERACTIVE%"=="0" set "BOOTSTRAP_INTERACTIVE=1"
+if "%~1"=="" (
+    start cmd /k "cd /d ""%~dp0"" && set AUTOMATED_MODE=1 && ""%~f0"" --interactive"
+    exit /b
+)
 :main
 setlocal EnableExtensions DisableDelayedExpansion
 
@@ -55,7 +59,7 @@ set "STATE_HW_RAM_GB="
 set "STATE_SUGGESTED_PRESET=3"
 set "STATE_UNC_WARNING=0"
 set "STATE_READONLY_WARNING=0"
-set "STATE_INTERACTIVE=%BOOTSTRAP_INTERACTIVE%"
+set "STATE_INTERACTIVE=0"
 
 set "ARG_INPUT="
 set "ARG_OUTPUT="
