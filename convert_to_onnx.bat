@@ -1,15 +1,6 @@
 @echo off
-REM === SELF-LAUNCH: Opens CMD window + runs interactive ===
-if defined AUTOMATED_MODE goto :main
-if /I "%~1"=="--interactive" (
-    set "AUTOMATED_MODE=1"
-    shift
-    goto :main
-)
-if "%~1"=="" (
-    start cmd /k "cd /d ""%~dp0"" && set AUTOMATED_MODE=1 && ""%~f0"" --interactive"
-    exit /b
-)
+REM === ENTRY: run in current window (no self-launch) ===
+goto :main
 :main
 setlocal EnableExtensions DisableDelayedExpansion
 
@@ -57,9 +48,13 @@ set "STATE_HW_GPU="
 set "STATE_HW_CPU="
 set "STATE_HW_RAM_GB="
 set "STATE_SUGGESTED_PRESET=3"
+set "STATE_SUGGESTED_REASON="
 set "STATE_UNC_WARNING=0"
 set "STATE_READONLY_WARNING=0"
 set "STATE_INTERACTIVE=0"
+set "STATE_PAUSE_ON_EXIT=0"
+set "STATE_TOTAL_STEPS=6"
+set "STATE_RESULT_LABEL=FAILED"
 
 set "ARG_INPUT="
 set "ARG_OUTPUT="
@@ -82,6 +77,11 @@ set "STATE_DELETE_RC=0"
 set "STATE_FAILING_COMMAND="
 
 set "STATE_POSITIONAL_COUNT=0"
+
+if "%~1"=="" (
+    set "STATE_INTERACTIVE=1"
+    set "STATE_PAUSE_ON_EXIT=1"
+)
 
 call :line
 call :title "YOLO .PT TO ONNX CONVERTER"
@@ -141,6 +141,7 @@ if errorlevel 1 (
 set "STATE_DID_PUSHD=1"
 
 call :init_logging
+if "%STATE_LOG_ENABLED%"=="1" echo [INFO] Run log: "%STATE_LOG_FILE%"
 call :log "args=%*"
 call :debug "ARG_INPUT=%ARG_INPUT%"
 call :debug "ARG_OUTPUT=%ARG_OUTPUT%"
@@ -148,14 +149,21 @@ call :debug "ARG_PRESET=%ARG_PRESET%"
 
 if "%STATE_INTERACTIVE%"=="1" (
     call :line
-    echo        YOLO PT^>ONNX CONVERTER v2.0 - INTERACTIVE
+    echo        YOLO PT^>ONNX CONVERTER - GUIDED MODE
     call :line
+)
+
+call :line
+if "%STATE_INTERACTIVE%"=="1" (
+    call :show_step 1 "Choose your input .pt model"
+) else (
+    call :show_step 1 "Resolving input .pt model"
 )
 
 if not "%ARG_INPUT%"=="" (
     set "RESOLVED_INPUT=%ARG_INPUT%"
 ) else (
-    if "%STATE_INTERACTIVE%"=="1" echo 1. Scanning .pt files...
+    if "%STATE_INTERACTIVE%"=="1" echo 1. Looking for .pt model files...
     call :select_input_model
     if errorlevel 1 goto :final
 )
@@ -187,6 +195,13 @@ if not exist "%RESOLVED_INPUT%" (
 )
 echo [OK] Input model found: "%RESOLVED_INPUT%"
 
+call :line
+if "%STATE_INTERACTIVE%"=="1" (
+    call :show_step 2 "Choose your output .onnx file"
+) else (
+    call :show_step 2 "Resolving output .onnx file path"
+)
+
 if "%ARG_OUTPUT%"=="" (
     if "%STATE_INTERACTIVE%"=="1" (
         call :prompt_output_name
@@ -196,8 +211,8 @@ if "%ARG_OUTPUT%"=="" (
     )
 ) else (
     for %%O in ("%ARG_OUTPUT%") do set "RESOLVED_OUTPUT=%%~fO"
-    if /I not "%RESOLVED_OUTPUT:~-5%"==".onnx" set "RESOLVED_OUTPUT=%RESOLVED_OUTPUT%.onnx"
 )
+if not "%RESOLVED_OUTPUT%"=="" if /I not "%RESOLVED_OUTPUT:~-5%"==".onnx" set "RESOLVED_OUTPUT=%RESOLVED_OUTPUT%.onnx"
 for %%O in ("%RESOLVED_OUTPUT%") do (
     set "RESOLVED_OUTPUT=%%~fO"
     set "RESOLVED_OUTPUT_DIR=%%~dpO"
@@ -232,7 +247,31 @@ goto :detect
 
 :detect
 call :line
-echo [STEP] Detecting Python...
+call :show_step 3 "Detecting hardware and recommending a preset"
+call :detect_hardware
+if errorlevel 1 (
+    echo [WARN] Hardware detection unavailable. Using preset suggestion: 3 - Balanced ^(recommended^)
+    set "STATE_SUGGESTED_PRESET=3"
+    set "STATE_SUGGESTED_REASON=hardware detection unavailable"
+)
+
+if "%ARG_PRESET%"=="" (
+    if "%STATE_INTERACTIVE%"=="1" echo 3. Choose conversion style [Enter=use recommended]
+    call :prompt_preset
+    if errorlevel 1 goto :final
+) else (
+    set "CURRENT_PRESET=%ARG_PRESET%"
+    call :apply_preset "%CURRENT_PRESET%"
+    if errorlevel 1 (
+        echo [ERROR] Invalid preset argument "%ARG_PRESET%". Use 1, 2, or 3.
+        call :fail 5 "Invalid preset argument" 2
+        goto :final
+    )
+)
+
+call :line
+call :show_step 4 "Checking Python and Ultralytics tools"
+echo [INFO] Checking Python...
 call :detect_python
 if errorlevel 1 goto :final
 echo [OK] Python is available: %STATE_PYTHON_CMD%
@@ -243,7 +282,7 @@ if not "%STATE_PYTHON_WHERE%"=="" (
 )
 
 call :line
-echo [STEP] Checking Ultralytics YOLO CLI ^(yolo^) ...
+echo [INFO] Checking Ultralytics YOLO CLI ^(yolo^) ...
 where yolo >nul 2>&1
 set "STATE_TMP_RC=%ERRORLEVEL%"
 call :debug "where yolo rc=%STATE_TMP_RC%"
@@ -265,26 +304,6 @@ if not "%STATE_TMP_RC%"=="0" (
     goto :final
 )
 echo [OK] YOLO CLI is available.
-
-call :detect_hardware
-if errorlevel 1 (
-    echo [WARN] Hardware detection unavailable. Using preset suggestion: 3 - Balanced (recommended)
-    set "STATE_SUGGESTED_PRESET=3"
-)
-
-if "%ARG_PRESET%"=="" (
-    if "%STATE_INTERACTIVE%"=="1" echo 3. Preset: [Enter=Auto hardware detect]
-    call :prompt_preset
-    if errorlevel 1 goto :final
-) else (
-    set "CURRENT_PRESET=%ARG_PRESET%"
-    call :apply_preset "%CURRENT_PRESET%"
-    if errorlevel 1 (
-        echo [ERROR] Invalid preset argument "%ARG_PRESET%". Use 1, 2, or 3.
-        call :fail 5 "Invalid preset argument" 2
-        goto :final
-    )
-)
 
 if "%ARG_OUTPUT%"=="" (
     if "%STATE_INTERACTIVE%"=="0" (
@@ -314,7 +333,7 @@ if exist "%RESOLVED_OUTPUT%" (
             )
         )
     ) else (
-        call :prompt_yes_no_cancel "Overwrite existing output file?" "N" "OVERWRITE_CHOICE"
+        call :prompt_yes_no_cancel "Output file already exists. Replace it?" "N" "OVERWRITE_CHOICE"
         if errorlevel 1 goto :final
         if /I "%OVERWRITE_CHOICE%"=="C" (
             call :fail 5 "User canceled because output already exists" 1
@@ -342,8 +361,8 @@ if exist "%RESOLVED_OUTPUT%" (
 goto :export
 
 :export
-if "%STATE_INTERACTIVE%"=="1" echo [STEP] Starting conversion...
 call :line
+call :show_step 5 "Converting the model to ONNX"
 echo [PLAN] Input file : "%RESOLVED_INPUT%"
 echo [PLAN] Output file: "%RESOLVED_OUTPUT%"
 echo [PLAN] Preset     : %CURRENT_PRESET_NAME%
@@ -410,7 +429,7 @@ echo [OK] Conversion complete.
 if "%STATE_ASSUME_YES%"=="1" (
     set "DELETE_CHOICE=Y"
 ) else (
-    call :prompt_yes_no_cancel "Delete source .pt model after successful conversion?" "N" "DELETE_CHOICE"
+    call :prompt_yes_no_cancel "Conversion succeeded. Delete the original .pt file?" "N" "DELETE_CHOICE"
     if errorlevel 1 goto :cleanup
 )
 
@@ -445,11 +464,19 @@ goto :final
 
 :final
 set "STATE_LAST_ERRORLEVEL=%ERRORLEVEL%"
+set "STATE_RESULT_LABEL=FAILED"
+if "%STATE_EXIT_CODE%"=="0" set "STATE_RESULT_LABEL=SUCCESS"
 call :line
-echo SUMMARY
-echo   Input file          : "%RESOLVED_INPUT%"
-echo   Output file         : "%RESOLVED_OUTPUT%"
-echo   Optimization preset : %CURRENT_PRESET_NAME% ^(imgsz=%CURRENT_IMGSZ%^)
+call :show_step 6 "Final summary"
+echo FINAL SUMMARY CARD
+call :line
+echo   Result              : %STATE_RESULT_LABEL%
+echo   Result message      : %STATE_EXIT_REASON%
+echo   Input model         : "%RESOLVED_INPUT%"
+echo   Output ONNX         : "%RESOLVED_OUTPUT%"
+echo   Preset chosen       : %CURRENT_PRESET_NAME% ^(imgsz=%CURRENT_IMGSZ%^)
+echo   Preset detail       : %CURRENT_PRESET_DESC%
+if not "%STATE_SUGGESTED_REASON%"=="" echo   Preset basis        : %STATE_SUGGESTED_REASON%
 if "%STATE_HW_DETECTED%"=="1" (
     if not "%STATE_HW_GPU%"=="" echo   Hardware GPU       : %STATE_HW_GPU%
     if not "%STATE_HW_CPU%"=="" echo   Hardware CPU       : %STATE_HW_CPU%
@@ -457,7 +484,11 @@ if "%STATE_HW_DETECTED%"=="1" (
 )
 if "%STATE_UNC_WARNING%"=="1" echo   Warning             : UNC path detected
 if "%STATE_READONLY_WARNING%"=="1" echo   Warning             : Read-only/permission risk detected
-echo   Exit status         : %STATE_EXIT_REASON%
+if "%STATE_LOG_ENABLED%"=="1" (
+    echo   Run log            : "%STATE_LOG_FILE%"
+) else (
+    echo   Run log            : unavailable
+)
 if "%STATE_EXIT_CODE%"=="5" echo   Exit code detail     : 5.%STATE_EXIT_SUBCODE%
 echo   Exit code           : %STATE_EXIT_CODE%
 echo   Final ERRORLEVEL    : %STATE_LAST_ERRORLEVEL%
@@ -471,6 +502,7 @@ call :log "export_rc=%STATE_EXPORT_RC% move_rc=%STATE_MOVE_RC% delete_rc=%STATE_
 call :log "exit_code=%STATE_EXIT_CODE% exit_subcode=%STATE_EXIT_SUBCODE% exit_reason=%STATE_EXIT_REASON%"
 
 if "%STATE_DID_PUSHD%"=="1" popd >nul 2>&1
+if "%STATE_PAUSE_ON_EXIT%"=="1" pause
 endlocal & exit /b %STATE_EXIT_CODE%
 
 :detect_python
@@ -510,9 +542,14 @@ set "STATE_HW_RAM_GB="
 where powershell >nul 2>&1
 if errorlevel 1 exit /b 1
 
-for /f "usebackq delims=" %%G in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; Get-CimInstance Win32_VideoController ^| Select-Object -First 1 -Expand Name" 2^>nul`) do if not defined STATE_HW_GPU set "STATE_HW_GPU=%%G"
-for /f "usebackq delims=" %%C in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; Get-CimInstance Win32_Processor ^| Select-Object -First 1 -Expand Name" 2^>nul`) do if not defined STATE_HW_CPU set "STATE_HW_CPU=%%C"
-for /f "usebackq delims=" %%R in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB)" 2^>nul`) do if not defined STATE_HW_RAM_GB set "STATE_HW_RAM_GB=%%R"
+for /f "usebackq delims=" %%G in (`powershell -NoProfile -Command "$ErrorActionPreference='SilentlyContinue'; $g=Get-CimInstance Win32_VideoController; if ($g -and $g.Count -gt 0) { $g[0].Name }" 2^>nul`) do if not defined STATE_HW_GPU set "STATE_HW_GPU=%%G"
+for /f "usebackq delims=" %%C in (`powershell -NoProfile -Command "$ErrorActionPreference='SilentlyContinue'; $c=Get-CimInstance Win32_Processor; if ($c -and $c.Count -gt 0) { $c[0].Name }" 2^>nul`) do if not defined STATE_HW_CPU set "STATE_HW_CPU=%%C"
+for /f "usebackq delims=" %%R in (`powershell -NoProfile -Command "$ErrorActionPreference='SilentlyContinue'; [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB)" 2^>nul`) do if not defined STATE_HW_RAM_GB set "STATE_HW_RAM_GB=%%R"
+if not defined STATE_HW_GPU for /f "delims=" %%G in ('wmic path Win32_VideoController get Name 2^>nul ^| findstr /R /V "^$ ^Name"') do if not defined STATE_HW_GPU set "STATE_HW_GPU=%%G"
+if not defined STATE_HW_CPU if not "%PROCESSOR_IDENTIFIER%"=="" set "STATE_HW_CPU=%PROCESSOR_IDENTIFIER%"
+if not defined STATE_HW_CPU if not "%PROCESSOR_ARCHITECTURE%"=="" set "STATE_HW_CPU=%PROCESSOR_ARCHITECTURE%"
+if not defined STATE_HW_GPU set "STATE_HW_GPU=Unavailable"
+if not defined STATE_HW_CPU set "STATE_HW_CPU=Unavailable"
 
 if defined STATE_HW_GPU set "STATE_HW_DETECTED=1"
 if defined STATE_HW_CPU set "STATE_HW_DETECTED=1"
@@ -520,34 +557,30 @@ if defined STATE_HW_RAM_GB set "STATE_HW_DETECTED=1"
 if "%STATE_HW_DETECTED%"=="0" exit /b 1
 
 set "STATE_SUGGESTED_PRESET=3"
-
-echo %STATE_HW_GPU%| find /I "RTX" >nul && set "STATE_SUGGESTED_PRESET=2"
-if "%STATE_SUGGESTED_PRESET%"=="3" echo %STATE_HW_GPU%| find /I "Intel" >nul && set "STATE_SUGGESTED_PRESET=1"
-if "%STATE_SUGGESTED_PRESET%"=="3" echo %STATE_HW_GPU%| find /I "UHD" >nul && set "STATE_SUGGESTED_PRESET=1"
-if not "%STATE_HW_RAM_GB%"=="" (
-    set /a STATE_RAM_NUM=%STATE_HW_RAM_GB%+0 >nul 2>&1
-    if not errorlevel 1 (
-        if %STATE_RAM_NUM% LSS 8 set "STATE_SUGGESTED_PRESET=1"
-        if %STATE_RAM_NUM% GEQ 16 if not "%STATE_SUGGESTED_PRESET%"=="1" echo %STATE_HW_GPU%| find /I "RTX" >nul && set "STATE_SUGGESTED_PRESET=2"
-    )
+set "STATE_SUGGESTED_REASON=limited hardware info"
+for /f "tokens=1,* delims=|" %%A in ('powershell -NoProfile -Command "$gpu=$env:STATE_HW_GPU; $cpu=$env:STATE_HW_CPU; $ram=0; [void][int]::TryParse($env:STATE_HW_RAM_GB,[ref]$ram); $score=0; $reasons=@(); if($ram -gt 0){ if($ram -lt 8){$score-=3; $reasons+='RAM<8GB'} elseif($ram -lt 16){$reasons+='RAM 8-15GB'} elseif($ram -lt 24){$score+=1; $reasons+='RAM 16-23GB'} else {$score+=2; $reasons+='RAM>=24GB'} } if($gpu -match 'RTX' -or $gpu -match '^ARC' -or $gpu -match '\sARC\s' -or $gpu -match 'RX\s*[6-9]\d{2,4}' -or $gpu -match 'A\d{3,4}'){ $score+=3; $reasons+='strong GPU' } elseif($gpu -match 'GTX' -or $gpu -match 'MX' -or $gpu -match 'Iris' -or $gpu -match 'Vega' -or $gpu -match 'Radeon\s+[6-9]\d{2}M'){ $score+=1; $reasons+='mid GPU' } elseif($gpu -match 'UHD' -or $gpu -match 'HD Graphics' -or $gpu -match 'Basic Display' -or $gpu -match 'Microsoft Basic'){ $score-=2; $reasons+='entry GPU' } if($cpu -match 'Ryzen\s*(7|9)' -or $cpu -match 'Core\(TM\)\s*i(7|9)' -or $cpu -match 'Core\s+Ultra\s*(7|9)'){ $score+=1; $reasons+='strong CPU' } elseif($cpu -match 'Celeron' -or $cpu -match 'Pentium' -or $cpu -match 'Athlon\s+Silver' -or $cpu -match 'Core\(TM\)\s*i3'){ $score-=1; $reasons+='entry CPU' } if($score -ge 3){$preset='2'} elseif($score -le -2){$preset='1'} else {$preset='3'} if(-not $reasons){$reasons+='limited hardware info'} Write-Output ($preset + '|' + ($reasons -join ', '))" 2^>nul') do (
+    if "%%A"=="1" set "STATE_SUGGESTED_PRESET=1"
+    if "%%A"=="2" set "STATE_SUGGESTED_PRESET=2"
+    if "%%A"=="3" set "STATE_SUGGESTED_PRESET=3"
+    if not "%%B"=="" set "STATE_SUGGESTED_REASON=%%B"
 )
 
 exit /b 0
 
 :prompt_preset
 call :line
-echo [INFO] Select optimization preset ^(Balanced is recommended^)
+echo [INFO] Pick conversion style. Press Enter to use the recommendation.
 if "%STATE_HW_DETECTED%"=="1" (
     if not "%STATE_HW_GPU%"=="" echo [INFO] Detected GPU: %STATE_HW_GPU%
     if not "%STATE_HW_CPU%"=="" echo [INFO] Detected CPU: %STATE_HW_CPU%
     if not "%STATE_HW_RAM_GB%"=="" echo [INFO] Detected RAM: %STATE_HW_RAM_GB% GB
 )
-echo [INFO] Suggested preset: %STATE_SUGGESTED_PRESET%
-echo        [1] Best performance - faster, lower compute
-
-echo        [2] Best detection   - higher quality, slower
-echo        [3] Balanced         - recommended
-call :validate_input "Enter 1, 2, or 3 [default %STATE_SUGGESTED_PRESET%]: " "%STATE_SUGGESTED_PRESET%" "1 2 3" "3" "CURRENT_PRESET"
+echo [INFO] Recommended option: %STATE_SUGGESTED_PRESET%
+if not "%STATE_SUGGESTED_REASON%"=="" echo [INFO] Recommendation basis: %STATE_SUGGESTED_REASON%
+echo        [1] Faster speed ^(lower quality potential^)
+echo        [2] Better detection quality ^(slower^)
+echo        [3] Balanced speed and quality ^(recommended for most users^)
+call :validate_input "Choose 1, 2, or 3 [default %STATE_SUGGESTED_PRESET%]: " "%STATE_SUGGESTED_PRESET%" "1 2 3" "3" "CURRENT_PRESET"
 if errorlevel 1 exit /b 1
 call :apply_preset "%CURRENT_PRESET%"
 if errorlevel 1 (
@@ -609,10 +642,10 @@ set "STATE_SELECT_TRY=0"
 set /a STATE_SELECT_TRY+=1
 set "STATE_CHOICE="
 if "%STATE_INTERACTIVE%"=="1" (
-    set /p STATE_CHOICE=[INPUT] Select model ^(1-!STATE_PT_COUNT!^) [Enter=1, C=Cancel]: 
+    set /p STATE_CHOICE=[INPUT] Choose model number ^(1-!STATE_PT_COUNT!^) [Enter=1, C=Cancel]: 
     if "!STATE_CHOICE!"=="" set "STATE_CHOICE=1"
 ) else (
-    set /p STATE_CHOICE=[INPUT] Select model number [1-!STATE_PT_COUNT!] or C: 
+    set /p STATE_CHOICE=[INPUT] Choose model number [1-!STATE_PT_COUNT!] or C: 
     if "!STATE_CHOICE!"=="" set "STATE_CHOICE=C"
 )
 if /I "!STATE_CHOICE!"=="C" (
@@ -647,9 +680,9 @@ goto :select_loop
 
 :prompt_output_name
 if not "%STATE_INTERACTIVE%"=="1" exit /b 0
-echo 2. Output filename: [Enter=%RESOLVED_INPUT_BASE%.onnx]
+echo 2. What should the output ONNX file be called? [Enter=%RESOLVED_INPUT_BASE%.onnx]
 set "STATE_OUTPUT_NAME="
-set /p STATE_OUTPUT_NAME=[INPUT] Output filename: 
+set /p STATE_OUTPUT_NAME=[INPUT] Output file name: 
 if "%STATE_OUTPUT_NAME%"=="" set "STATE_OUTPUT_NAME=%RESOLVED_INPUT_BASE%.onnx"
 for %%O in ("%STATE_OUTPUT_NAME%") do set "STATE_OUTPUT_CLEAN=%%~nxO"
 if "%STATE_OUTPUT_CLEAN%"=="" set "STATE_OUTPUT_CLEAN=%RESOLVED_INPUT_BASE%.onnx"
@@ -749,16 +782,18 @@ if not "%STATE_PATH_LEN:~240,1%"=="" (
 exit /b 0
 
 :init_logging
-if "%STATE_VERBOSE%"=="0" exit /b 0
 set "STATE_LOG_DIR=%~dp0logs"
 if not exist "%STATE_LOG_DIR%" mkdir "%STATE_LOG_DIR%" >nul 2>&1
 if not exist "%STATE_LOG_DIR%" exit /b 0
 
-set "STATE_LOG_DATE="
-for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd" 2^>nul`) do if not defined STATE_LOG_DATE set "STATE_LOG_DATE=%%D"
-if "%STATE_LOG_DATE%"=="" set "STATE_LOG_DATE=%date:/=-%"
-set "STATE_LOG_FILE=%STATE_LOG_DIR%\convert_to_onnx_%STATE_LOG_DATE%.log"
->>"%STATE_LOG_FILE%" echo [%date% %time%] session start
+set "STATE_LOG_RUNSTAMP="
+for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd_HHmmss" 2^>nul`) do if not defined STATE_LOG_RUNSTAMP set "STATE_LOG_RUNSTAMP=%%D"
+if "%STATE_LOG_RUNSTAMP%"=="" set "STATE_LOG_RUNSTAMP=%date:/=-%_%time::=-%"
+set "STATE_LOG_RUNSTAMP=%STATE_LOG_RUNSTAMP: =0%"
+set "STATE_LOG_RUNSTAMP=%STATE_LOG_RUNSTAMP:.=%"
+set "STATE_LOG_RUNSTAMP=%STATE_LOG_RUNSTAMP:,=%"
+set "STATE_LOG_FILE=%STATE_LOG_DIR%\convert_to_onnx_%STATE_LOG_RUNSTAMP%.log"
+>"%STATE_LOG_FILE%" echo [%date% %time%] session start
 if errorlevel 1 exit /b 0
 set "STATE_LOG_ENABLED=1"
 exit /b 0
@@ -789,6 +824,11 @@ if "%~3"=="" (
 ) else (
     set "STATE_EXIT_SUBCODE=%~3"
 )
+exit /b 0
+
+:show_step
+echo [STEP %~1/%STATE_TOTAL_STEPS%] %~2
+call :log "step=%~1/%STATE_TOTAL_STEPS% text=%~2"
 exit /b 0
 
 :line
